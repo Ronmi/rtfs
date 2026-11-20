@@ -25,7 +25,6 @@ Recommends: niri,
             xdg-desktop-portal,
             qml6-module-qtquick-effects,
             pinentry-gnome3 | pinentry,
-            wvkbd,
             swaylock,
             brightnessctl,
             wl-mirror,
@@ -33,6 +32,7 @@ Recommends: niri,
             nm-connection-editor,
             blueman,
             iio-sensor-proxy,
+            pavucontrol,
 Description: Ronmi's Twice Flavored Shell, a QuickShell desktop shell for niri
  rtfs (Ronmi's Twice Flavored Shell) is a personal desktop shell built
  with QuickShell: bar, notifications, launcher, OSD, wallpaper, lock

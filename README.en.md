@@ -1,6 +1,6 @@
 # rtfs — Ronmi's Twice Flavored Shell
 
-[繁體中文](README.md)
+[繁體中文](README.tw.md) · Install: [INSTALL.en.md](INSTALL.en.md) · For AI agents: [README.md](README.md)
 
 A desktop shell for the [niri](https://github.com/niri-wm/niri) Wayland compositor, built with
 [QuickShell](https://quickshell.org/) and dressed in TWICE's nine member colors.
@@ -32,7 +32,7 @@ I think a Framework Laptop 12 running rtfs makes a great laptop for a ONCE. Here
   auto-rotation, a touch-friendly launcher, and a bar that adapts to portrait. Touchscreen gestures are the
   main thing it does not handle.
 
-rtfs runs on other hardware too; see [Hardware](#hardware). I bought my Framework myself, and nobody
+rtfs runs on other hardware too; see [Hardware support](INSTALL.en.md#hardware-support). I bought my Framework myself, and nobody
 pays me for saying this.
 
 ## What's in it
@@ -72,74 +72,10 @@ There are no screenshots yet.
   polkit agent and a regular pinentry instead. Disabling these parts is a small edit; see
   [Customizing](#customizing-with-an-ai-agent).
 
-## Requirements
-
-- **niri** — developed against niri 26.04 + later main. The on-screen keyboard needs niri with
-  [PR #4548](https://github.com/niri-wm/niri/pull/4548) (after 26.04) to trigger niri shortcuts
-  and input-method switching.
-- **QuickShell 0.3.2** exactly-ish: rtfs uses the 0.3.2 API. Newer versions may break things; older ones will.
-- Debian 13 (trixie) is what I run. Other distributions should work if you get the dependencies
-  below; package names differ.
-- Runtime (Debian names): `qml6-module-qtquick`, `qml6-module-qtquick-controls`,
-  `qml6-module-qtquick-layouts`, `python3`, `python3-yaml`, `python3-gi`, `gir1.2-glib-2.0`,
-  `libglib2.0-bin`, `fonts-font-awesome`, `fonts-material-design-icons-iconfont`.
-  Optional: `qml6-module-qtquick-effects` (lock screen blur), `brightnessctl`, `wl-mirror`, `rfkill`,
-  `iio-sensor-proxy` (auto-rotate), `nm-connection-editor`, `blueman`, `xdg-desktop-portal`, `swaylock` (fallback).
-- NetworkManager, BlueZ, PipeWire and UPower for the corresponding blocks.
-
 ## Installing
 
-My Debian package registry is private, so install from source:
-
-```sh
-git clone <this repository> ~/src/rtfs
-ln -s ~/src/rtfs/shell ~/.config/quickshell   # rtfs becomes your default QuickShell config
-qs -n                                          # try it
-```
-
-The scripts in `scripts/` are found relative to `shell/`, so keep the two directories together.
-To build a Debian package instead: `dpkg-buildpackage -b -us -uc` (needs `debhelper`).
-
-Then add to your niri `config.kdl`:
-
-```kdl
-spawn-at-startup "qs" "-n"
-
-// rtfs-ui / rtfs-zenity dialogs float.
-window-rule {
-    match app-id=r#"^org\.quickshell$"#
-    open-floating true
-}
-
-// Show the wallpaper behind the overview too.
-layer-rule {
-    match namespace="^wallpaper$"
-    place-within-backdrop true
-}
-
-binds {
-    Mod+D { spawn "qs" "ipc" "call" "launcher" "toggle"; }
-    Mod+N { spawn "qs" "ipc" "call" "notifications" "toggleCenter"; }
-    Super+Alt+L { spawn-sh "qs ipc call lock lock || swaylock"; }
-}
-```
-
-Stop whatever bar, notification daemon, wallpaper tool and polkit agent you used before.
-[debian/README.Debian](debian/README.Debian) (Chinese) has the rest: tablet-mode switch events,
-the gpg pinentry, the Framework microphone switch, and wiring GTK/Qt/niri to the palette.
-Ask your AI agent to translate it if you need to.
-
-## Hardware
-
-Tested only on a **Framework Laptop 12** (Intel). Nothing requires it:
-
-| Feature | Needs | Without it |
-|---|---|---|
-| Hardware microphone switch indicator | A Framework laptop's EC (`/dev/cros_ec`, needs a udev `uaccess` rule) | The mic icon shows whenever a microphone exists |
-| Fan speed and chassis temperatures | `cros_ec` hwmon (Framework / Chromebook) | Not shown |
-| CPU temperature | `coretemp` (Intel) or `k10temp` / `zenpower` (AMD) | Not shown |
-| Tablet mode, OSK button, auto-rotate | A convertible reporting tablet-mode switch events, an accelerometer via iio-sensor-proxy | Hidden |
-| Battery, brightness | UPower battery, `/sys/class/backlight` | Hidden (works on desktops) |
+You need niri and QuickShell 0.3.2. [INSTALL.en.md](INSTALL.en.md) has the full steps, a prompt for doing
+it with an AI agent, and which features work on which hardware.
 
 ## Customizing with an AI agent
 
