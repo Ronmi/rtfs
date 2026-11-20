@@ -1,0 +1,203 @@
+#!/usr/bin/python3 -I
+"""耳機孔「插入了什麼」詢問（由 shell 的 HeadsetPrompt 啟動，不是給人直接執行的）。
+
+二合一耳機孔分不出插的是耳機（三段）還是耳麥（四段）：ALSA 只有耳機孔的偵測，
+耳麥麥克風的 jack 是 phantom，PipeWire 的耳麥麥克風路徑會跟著耳機路徑一起變成可用。
+WirePlumber 依優先度選，通常留在內建麥克風，所以插耳麥時線上的麥克風不會被用到。
+GNOME 的做法是跳出對話框問；這裡改成一則帶按鈕的通知，忽略它就維持 WirePlumber 的選擇。
+
+判斷方式跟 GNOME 一樣看 port.availability-group：同一個群組裡同時有輸出路徑和
+port.type 為 headset 的輸入路徑，而且兩者剛從不可用變成可用，就是需要問的情況。
+路徑可用狀態的變化靠 `alsactl monitor` 的 jack 事件觸發（pw-dump --monitor 太吵），
+等 WirePlumber 處理完再用 pw-dump 讀；切換用 `pw-cli set-param <device> Route`
+（QuickShell 0.3.2 沒有 route API）。
+
+沒有輸出協定；stdin 關閉（shell 結束）就跟著結束。缺 alsactl／pw-dump 時直接結束（代碼 0）。
+`--test` 立刻對目前可用的群組發一次通知，給開發時測試用。
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+# 介面文字翻譯（shell/i18n）。腳本目錄不一定在 sys.path（python3 -I、從 /usr/bin 的 symlink 執行），自己加。
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from rtfs_i18n import tr  # noqa: E402
+
+from gi.repository import Gio, GLib  # noqa: E402
+
+NOTIFY = ("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+          "org.freedesktop.Notifications")
+# jack 事件之後等 WirePlumber 更新路徑的時間；插拔時事件是一小串，也順便合併掉。
+SETTLE_MS = 800
+
+bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+# 上次看到「可用」的群組：(裝置 id, 群組名稱) 的集合；只在從無到有時才問。
+seen = set()
+# 通知 id → 這則通知要切換的路徑資訊
+pending = {}
+# (裝置 id, 群組名稱) → 通知 id，拔掉時收回通知用
+notified = {}
+settle_timer = 0
+
+
+def info_dict(route):
+    # SPA 的 info 是 [個數, key, value, key, value, …]
+    flat = route.get("info", [])[1:]
+    return dict(zip(flat[0::2], flat[1::2]))
+
+
+def available(route):
+    return route.get("available") != "no"
+
+
+def ambiguous_groups():
+    """回傳 {(裝置 id, 群組): 切換資訊}，只含目前可用、需要詢問的群組。"""
+    try:
+        objs = json.loads(subprocess.run(["pw-dump"], capture_output=True, text=True,
+                                         check=True).stdout)
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return {}
+    result = {}
+    for obj in objs:
+        if obj.get("type") != "PipeWire:Interface:Device":
+            continue
+        info = obj.get("info") or {}
+        if (info.get("props") or {}).get("device.api") != "alsa":
+            continue
+        params = info.get("params") or {}
+        routes = params.get("EnumRoute") or []
+        active_in = [r for r in params.get("Route") or [] if r.get("direction") == "Input"]
+        if not active_in:
+            continue
+        groups = {}
+        for r in routes:
+            g = info_dict(r).get("port.availability-group")
+            if g:
+                groups.setdefault(g, []).append(r)
+        for g, members in groups.items():
+            headset = [r for r in members if r["direction"] == "Input"
+                       and info_dict(r).get("port.type") == "headset" and available(r)]
+            outputs = [r for r in members if r["direction"] == "Output" and available(r)]
+            if not headset or not outputs:
+                continue
+            # 選「耳機」時改回的麥克風：群組以外、可用、優先度最高的輸入路徑（通常是內建麥克風）。
+            others = [r for r in routes if r["direction"] == "Input" and available(r)
+                      and info_dict(r).get("port.availability-group") != g]
+            mic = max(others, key=lambda r: r.get("priority", 0), default=None)
+            result[(obj["id"], g)] = {
+                "device": obj["id"],
+                "profile_device": active_in[0]["device"],
+                "headset": headset[0]["index"],
+                "mic": mic["index"] if mic else None,
+            }
+    return result
+
+
+def notify(key, target):
+    old = notified.get(key, 0)
+    actions = ["headphones", tr("耳機"), "headset", tr("耳麥")]
+    reply = bus.call_sync(
+        *NOTIFY, "Notify",
+        GLib.Variant("(susssasa{sv}i)", (
+            "rtfs", old, "audio-headphones", tr("插入了什麼音訊裝置？"),
+            tr("耳機孔分不出耳機和耳麥。選「耳麥」才會使用線上的麥克風。"),
+            actions, {}, -1)),
+        GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, -1, None)
+    nid = reply.unpack()[0]
+    pending.pop(old, None)
+    pending[nid] = target
+    notified[key] = nid
+
+
+def withdraw(key):
+    nid = notified.pop(key, None)
+    if nid is None:
+        return
+    pending.pop(nid, None)
+    try:
+        bus.call_sync(*NOTIFY, "CloseNotification", GLib.Variant("(u)", (nid,)),
+                      None, Gio.DBusCallFlags.NONE, -1, None)
+    except GLib.Error:
+        pass
+
+
+def set_route(target, index):
+    if index is None:
+        return
+    pod = "{ index: %d, device: %d, save: true }" % (index, target["profile_device"])
+    subprocess.run(["pw-cli", "set-param", str(target["device"]), "Route", pod],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def on_signal(_conn, _sender, _path, _iface, name, params, _data):
+    args = params.unpack()
+    nid = args[0]
+    if name == "ActionInvoked":
+        target = pending.get(nid)
+        if target:
+            set_route(target, target["headset"] if args[1] == "headset" else target["mic"])
+    elif name == "NotificationClosed":
+        pending.pop(nid, None)
+        for k, v in list(notified.items()):
+            if v == nid:
+                del notified[k]
+
+
+def check():
+    global settle_timer, seen
+    settle_timer = 0
+    now = ambiguous_groups()
+    for key in now.keys() - seen:
+        notify(key, now[key])
+    for key in seen - now.keys():
+        withdraw(key)
+    seen = set(now)
+    return GLib.SOURCE_REMOVE
+
+
+def on_alsa(source, _cond):
+    line = source.readline()
+    if not line:
+        loop.quit()
+        return GLib.SOURCE_REMOVE
+    # 例：node hw:0, #15 (0,0,0,Headphone Jack,0) VALUE。其他控制項（音量、開關）不管。
+    global settle_timer
+    if " Jack," in line and "Phantom" not in line:
+        if settle_timer:
+            GLib.source_remove(settle_timer)
+        settle_timer = GLib.timeout_add(SETTLE_MS, check)
+    return GLib.SOURCE_CONTINUE
+
+
+def on_stdin(source, _cond):
+    if not source.readline():
+        loop.quit()
+        return GLib.SOURCE_REMOVE
+    return GLib.SOURCE_CONTINUE
+
+
+if not (shutil.which("alsactl") and shutil.which("pw-dump") and shutil.which("pw-cli")):
+    sys.exit(0)
+
+bus.signal_subscribe(NOTIFY[0], NOTIFY[2], None, NOTIFY[1], None,
+                     Gio.DBusSignalFlags.NONE, on_signal, None)
+loop = GLib.MainLoop()
+
+if "--test" in sys.argv:
+    seen = set()
+    check()
+else:
+    # 啟動時已經插著的不問（qs 重開不該再跳一次）。
+    seen = set(ambiguous_groups())
+    GLib.io_add_watch(sys.stdin, GLib.IO_IN | GLib.IO_HUP, on_stdin)
+
+# 不指定音效卡時 alsactl 監聽所有卡，熱插拔的 USB 卡之後才出現的不算（那些也沒有二合一孔的問題）。
+monitor = subprocess.Popen(["stdbuf", "-oL", "alsactl", "monitor"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True)
+GLib.io_add_watch(monitor.stdout, GLib.IO_IN | GLib.IO_HUP, on_alsa)
+try:
+    loop.run()
+finally:
+    monitor.terminate()

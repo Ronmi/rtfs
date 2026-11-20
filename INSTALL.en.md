@@ -42,7 +42,8 @@ Debian package names (find the equivalents on other distributions):
 - Recommended: `xdg-desktop-portal` (file chooser), `qml6-module-qtquick-effects` (lock screen blur),
   `swaylock` (fallback locker), `brightnessctl` (brightness slider), `wl-mirror` (screen mirroring),
   `rfkill` (airplane mode), `nm-connection-editor` and `blueman` (network and Bluetooth settings),
-  `iio-sensor-proxy` (auto-rotation), `pavucontrol` (sound settings).
+  `iio-sensor-proxy` (auto-rotation), `pavucontrol` (sound settings),
+  `alsa-utils` and `pipewire-bin` (headphones-or-headset prompt for combo jacks).
 - Services the blocks read from: NetworkManager, BlueZ, PipeWire, UPower.
 
 ### 2. Get rtfs
@@ -173,6 +174,7 @@ Tested only on a **Framework Laptop 12** (Intel). Nothing requires it:
 | Fan speed and chassis temperatures | `cros_ec` hwmon (Framework / Chromebook) | Not shown |
 | CPU temperature | `coretemp` (Intel) or `k10temp` / `zenpower` (AMD) | Not shown |
 | Tablet mode, OSK button, auto-rotation | A convertible reporting tablet-mode switch events, an accelerometer via iio-sensor-proxy | Hidden |
+| Headphones-or-headset prompt | A combo jack whose headset mic shares an availability group with the headphone output (common on laptops) | Never asked; WirePlumber's choice stays |
 | Battery, brightness | UPower battery, `/sys/class/backlight` | Hidden (works on desktops) |
 
 ## Going back

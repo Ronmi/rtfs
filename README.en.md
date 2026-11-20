@@ -43,6 +43,7 @@ pays me for saying this.
 - **System menu** in the style of GNOME quick settings: volume and audio devices, brightness,
   media controls (MPRIS), keep-awake, screen mirroring, wallpaper rotation, auto-rotate,
   batteries, screenshots, power actions. Microphone/camera privacy indicators on the bar.
+  Plugging into a combo jack asks (by notification) whether it is headphones or a headset, like GNOME.
 - **Notifications**: banners and a notification center (grouping, do-not-disturb, actions, inline reply).
 - **Launcher**: full-screen, paged app grid, also usable by touch in tablet mode.
 - **Lock screen** with PAM, idle lock, screen off, lock before suspend, relock after a crash.

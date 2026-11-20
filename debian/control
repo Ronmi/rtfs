@@ -33,6 +33,8 @@ Recommends: niri,
             blueman,
             iio-sensor-proxy,
             pavucontrol,
+            alsa-utils,
+            pipewire-bin,
 Description: Ronmi's Twice Flavored Shell, a QuickShell desktop shell for niri
  rtfs (Ronmi's Twice Flavored Shell) is a personal desktop shell built
  with QuickShell: bar, notifications, launcher, OSD, wallpaper, lock

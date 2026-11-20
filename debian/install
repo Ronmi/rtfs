@@ -1,6 +1,7 @@
 shell/*.qml usr/share/rtfs/shell
 shell/*.js usr/share/rtfs/shell
 shell/i18n usr/share/rtfs/shell
+scripts/rtfs-jack usr/share/rtfs/scripts
 scripts/rtfs-pinentry usr/share/rtfs/scripts
 scripts/rtfs-portal usr/share/rtfs/scripts
 scripts/rtfs-privacy usr/share/rtfs/scripts

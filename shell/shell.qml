@@ -32,4 +32,5 @@ ShellRoot {
     SystemOsd {}
     OskWindow {}
     AutoLock {}
+    HeadsetPrompt {}
 }

@@ -41,7 +41,8 @@ rtfs 是原樣公開的個人專案（見 [README.tw.md](README.tw.md) 的聲明
 - 建議：`xdg-desktop-portal`（檔案選擇）、`qml6-module-qtquick-effects`（鎖定畫面模糊）、
   `swaylock`（備援鎖定程式）、`brightnessctl`（亮度滑桿）、`wl-mirror`（螢幕鏡像）、
   `rfkill`（飛航模式）、`nm-connection-editor` 和 `blueman`（網路、藍牙設定）、
-  `iio-sensor-proxy`（自動旋轉）、`pavucontrol`（音效設定）。
+  `iio-sensor-proxy`（自動旋轉）、`pavucontrol`（音效設定）、
+  `alsa-utils` 和 `pipewire-bin`（二合一耳機孔的耳機／耳麥詢問）。
 - 各色塊讀取資料的服務：NetworkManager、BlueZ、PipeWire、UPower。
 
 ### 2. 取得 rtfs
@@ -164,6 +165,7 @@ ln -s "$RTFS/theme/gtk4.css" ~/.config/gtk-4.0/gtk.css
 | 風扇轉速、機身溫度 | `cros_ec` hwmon（Framework／Chromebook） | 不顯示 |
 | CPU 溫度 | `coretemp`（Intel）或 `k10temp`／`zenpower`（AMD） | 不顯示 |
 | 平板模式、螢幕鍵盤按鈕、自動旋轉 | 會送出平板模式 switch 事件的二合一筆電，以及透過 iio-sensor-proxy 讀取的加速度計 | 不顯示 |
+| 耳機／耳麥詢問 | 耳麥麥克風和耳機輸出在同一個 availability group 的二合一耳機孔（筆電常見） | 不會詢問，維持 WirePlumber 的選擇 |
 | 電池、亮度 | UPower 電池、`/sys/class/backlight` | 不顯示（桌機也能用） |
 
 ## 還原
