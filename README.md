@@ -9,6 +9,18 @@
 > （專案裡的 CLAUDE.md 和 memories/ 就是給 AI 看的，交給你的 AI 處理通常就夠了）。
 > issue 和 PR 看心情處理，請不要期待支援。
 
+## 推坑：給 ONCE 的 Framework Laptop 12
+
+我覺得 Framework Laptop 12 裝上 rtfs，非常適合 ONCE 使用：
+
+- **外觀就很 TWICE**：Bubblegum 機身配 Lavender 鍵盤，就是一台 MiSaMo 風格（淺藍綠、紫、桃色）的二合一筆電。Framework 本來就鼓勵客製化，還可以把上蓋中間的 Framework 齒輪換成 CandyBong，TWICE 感直接大幅提升。
+- **畫面上隨時都有九人九色**：rtfs 預設讓九人九色和官方漸層一直出現在畫面上（狀態列色塊、視窗外框、選單、OSD）。感謝 JYPE 當初挑選九人九色的用心：每個顏色都貼近成員給人的感覺，九個顏色並排起來也很協調，所以整個畫面都是這些顏色也不會顯得雜亂。
+- **二合一在追星時真的用得到**：反折成平板當電子白板或手繪板（需要裝 Rnote、Xournal++ 這類程式）。平常當文書機或寫程式也夠用。
+- **便宜**：我找到的同等級硬體裡，比 FW12 便宜的選擇極少，而且全都不是二合一，大多連觸控螢幕都沒有。
+- **預設值已經調好**：平板用得到的螢幕鍵盤、自動旋轉、適合觸控的程式啟動器、直立時自動調整的狀態列都已經有不錯的預設值；主要只差觸控螢幕手勢還沒支援。
+
+rtfs 在其他硬體上也能用，見 [README.en.md](README.en.md) 的 Hardware 一節。FW12 是我自己買的，這段推坑沒有收任何人的錢。
+
 ## 緣起
 
 從 GNOME 換到 niri（設定在 `~/raoh/niri`）之後，社群常見的現成元件（waybar、swaync、fuzzel……）雖然能用，但跟 GNOME 比起來缺乏一致性，看不順眼的地方不少。這個專案就是用 QuickShell 把這些元件換成符合自己習慣和風格的版本。
@@ -23,7 +35,7 @@
 
 ## 聲明
 
-- **粉絲作品**：受 TWICE、GNOME、Framework 啟發，但跟它們（以及 TWICE 所屬的 JYP Entertainment、GNOME Foundation、Framework Computer Inc.）沒有任何關係，也沒有得到它們的認可或贊助。成員色是粉絲整理的版本，不是官方色。
+- **粉絲作品**：受 TWICE、GNOME、Framework 啟發，但跟它們（以及 TWICE 所屬的 JYP Entertainment、GNOME Foundation、Framework Computer Inc.）沒有任何關係，也沒有得到它們的認可或贊助。九人九色是 JYPE 選的，`theme/palette.sh` 裡的色碼則是粉絲整理的版本，不是官方色碼。本專案沒有任何贊助，包括 Framework。
 - **沒有任何保證**：以 MIT 授權原樣提供（見 [LICENSE](LICENSE)）。
 - **跟密碼有關的元件沒有經過審查**：鎖定畫面、polkit 驗證視窗、`rtfs-pinentry` 都會經手密碼，跟其他部分一樣是 vibe coding 寫的；已知還沒查證的一點是 QuickShell 當掉時留下的 crash dump 會不會含有正在輸入的密碼。介意的話請繼續用 swaylock 等鎖定程式、原本的 polkit agent 和 pinentry。
 

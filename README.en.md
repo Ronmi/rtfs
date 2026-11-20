@@ -11,6 +11,30 @@ It is the shell I use every day on a Framework Laptop 12.
 > and I change it whenever I feel like it. Take it, fork it, rip parts out of it.
 > I may or may not look at issues and pull requests; please don't expect support.
 
+## A Framework Laptop 12 for ONCEs
+
+I think a Framework Laptop 12 running rtfs makes a great laptop for a ONCE. Here is why:
+
+- **It looks the part.** Pick the Bubblegum chassis with the Lavender keyboard and you have a 2-in-1
+  in MiSaMo-ish colors (mint, lavender, peach). Framework laptops are made to be customized, so you can
+  go further: replace the Framework gear in the middle of the lid with a CandyBong and it becomes
+  unmistakably a TWICE laptop.
+- **TWICE is on screen all the time.** By default rtfs keeps all nine member colors and the official
+  gradient visible: the bar blocks, window borders, menus and OSD. Thanks to JYPE for the care that went
+  into choosing the nine colors: each one fits its member, and all nine sit well side by side, so a
+  screen full of them still looks calm rather than noisy.
+- **A 2-in-1 is useful for fandom.** Fold it into a tablet and use it as a digital whiteboard or sketchbook
+  (with an app such as Rnote or Xournal++). It is also plenty for everyday office work and for software
+  development.
+- **It is affordable.** I found very few cheaper laptops with comparable hardware, and none of them were
+  2-in-1s; most did not even have a touchscreen.
+- **The defaults are ready for it.** rtfs already has sensible defaults for tablet use: on-screen keyboard,
+  auto-rotation, a touch-friendly launcher, and a bar that adapts to portrait. Touchscreen gestures are the
+  main thing it does not handle.
+
+rtfs runs on other hardware too; see [Hardware](#hardware). I bought my Framework myself, and nobody
+pays me for saying this.
+
 ## What's in it
 
 - **Bar** with eight blocks in member colors (in TWICE's age order from the right):
@@ -38,7 +62,8 @@ There are no screenshots yet.
 - **Fan-made.** rtfs is inspired by TWICE, GNOME and Framework, and is not affiliated with,
   endorsed by or sponsored by any of them. TWICE is associated with JYP Entertainment;
   GNOME is a trademark of the GNOME Foundation; Framework is a trademark of Framework Computer Inc.
-  The member colors are fan-picked, not official.
+  The nine member colors were chosen by JYPE; the exact color values in `theme/palette.sh` are a
+  fan-compiled version, not official ones. Nobody sponsors this project, Framework included.
 - **No warranty.** rtfs is provided "as is" under the MIT license (see [LICENSE](LICENSE)).
 - **Security-sensitive parts are not audited.** The lock screen, the polkit agent and `rtfs-pinentry`
   handle your password. They were written the same vibe-coded way as everything else and nobody has
