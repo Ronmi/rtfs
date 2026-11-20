@@ -1,0 +1,126 @@
+#!/usr/bin/python3
+"""rtfs-portal：透過 xdg-desktop-portal 開啟系統的檔案選擇對話框（給 shell/DialogFile.qml 用，也可以單獨執行）。
+
+檔案選擇不自己畫（等於要做一整個檔案瀏覽器），交給 portal；畫面由 portal 後端決定（目前是 GNOME 的）。
+
+用法：
+  rtfs-portal file [--save] [--directory] [--multiple] [--title 標題] [--filename 路徑]
+                   [--filter "名稱 | *.a *.b"]... [--timeout 秒]
+    --filename：一開始選取的檔案或目錄；結尾是 "/" 的絕對路徑代表「在這個目錄開始」；
+                存檔模式下檔案不存在時，當成建議的檔名。
+    --filter：可重複；「名稱 | 樣式 樣式」或只有「樣式 樣式」（名稱就是整串）。
+
+輸出一行 JSON：{"status": "ok" | "cancel" | "timeout", "paths": [...]}，exit 0；錯誤 exit 2。
+"""
+
+import argparse
+import json
+import os
+import secrets
+import sys
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+PORTAL = "org.freedesktop.portal.Desktop"
+PORTAL_PATH = "/org/freedesktop/portal/desktop"
+
+
+def bytes_path(path):
+    # portal 的路徑參數是以 NUL 結尾的位元組陣列。
+    return GLib.Variant("ay", os.fsencode(path) + b"\0")
+
+
+def parse_filter(text):
+    """zenity 的 --file-filter 格式：「名稱 | 樣式 樣式」或「樣式 樣式」。"""
+    name, bar, patterns = text.partition("|")
+    if not bar:
+        name, patterns = text, text
+    return name.strip(), [(0, p) for p in patterns.split(" ") if p]  # 0 = glob 樣式
+
+
+def choose_file(args):
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    # portal 用 handle_token 決定 Request 物件的路徑，先訂閱它的 Response 才不會漏掉。
+    token = "rtfs" + secrets.token_hex(6)
+    sender = bus.get_unique_name()[1:].replace(".", "_")
+    handle = f"{PORTAL_PATH}/request/{sender}/{token}"
+    loop = GLib.MainLoop()
+    outcome = {"status": "cancel", "paths": []}
+
+    def on_response(_conn, _sender, _path, _iface, _signal, params, _data):
+        code, results = params.unpack()
+        if code == 0:
+            outcome["status"] = "ok"
+            outcome["paths"] = [Gio.File.new_for_uri(u).get_path() or u for u in results.get("uris", [])]
+        loop.quit()
+
+    bus.signal_subscribe(PORTAL, "org.freedesktop.portal.Request", "Response", handle,
+                         None, Gio.DBusSignalFlags.NO_MATCH_RULE, on_response, None)
+
+    options = {"handle_token": GLib.Variant("s", token)}
+    method = "SaveFile" if args.save and not args.directory else "OpenFile"
+    if method == "OpenFile":
+        options["multiple"] = GLib.Variant("b", args.multiple)
+        options["directory"] = GLib.Variant("b", args.directory)
+    if args.filter:
+        options["filters"] = GLib.Variant("a(sa(us))", [parse_filter(f) for f in args.filter])
+
+    if args.filename:
+        path = os.path.abspath(os.path.expanduser(args.filename))
+        if args.filename.endswith("/") and os.path.isabs(args.filename):
+            options["current_folder"] = bytes_path(path)
+        elif method == "SaveFile" and not os.path.exists(path):
+            options["current_folder"] = bytes_path(os.path.dirname(path))
+            options["current_name"] = GLib.Variant("s", os.path.basename(path))
+        elif method == "SaveFile":
+            options["current_file"] = bytes_path(path)
+        else:
+            folder = path if os.path.isdir(path) else os.path.dirname(path)
+            options["current_folder"] = bytes_path(folder)
+
+    bus.call_sync(PORTAL, PORTAL_PATH, "org.freedesktop.portal.FileChooser", method,
+                  GLib.Variant("(ssa{sv})", ("", args.title or "", options)),
+                  GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None)
+
+    if args.timeout and args.timeout > 0:
+        def on_timeout():
+            outcome["status"] = "timeout"
+            try:
+                bus.call_sync(PORTAL, handle, "org.freedesktop.portal.Request", "Close",
+                              None, None, Gio.DBusCallFlags.NONE, -1, None)
+            except GLib.Error:
+                pass
+            loop.quit()
+            return False
+        GLib.timeout_add_seconds(args.timeout, on_timeout)
+
+    loop.run()
+    return outcome
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="rtfs-portal")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    f = sub.add_parser("file")
+    f.add_argument("--save", action="store_true")
+    f.add_argument("--directory", action="store_true")
+    f.add_argument("--multiple", action="store_true")
+    f.add_argument("--title")
+    f.add_argument("--filename")
+    f.add_argument("--filter", action="append")
+    f.add_argument("--timeout", type=int)
+    args = ap.parse_args()
+    try:
+        out = choose_file(args)
+    except GLib.Error as e:
+        print(f"rtfs-portal: {e.message}", file=sys.stderr)
+        return 2
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

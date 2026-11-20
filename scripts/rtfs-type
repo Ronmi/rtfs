@@ -1,0 +1,160 @@
+#!/usr/bin/python3 -I
+"""rtfs-type：送出按鍵或文字給目前有焦點的視窗（像按鍵精靈），給 niri 的熱鍵綁定用。
+
+用法與限制見下面的 USAGE（--help 印出的就是它）。
+"""
+import os
+import subprocess
+import sys
+import time
+
+# 介面文字翻譯（shell/i18n）。腳本目錄不一定在 sys.path（python3 -I、從 /usr/bin 的 symlink 執行），自己加。
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from rtfs_i18n import tr  # noqa: E402
+
+USAGE = tr("""rtfs-type：送出按鍵或文字給目前有焦點的視窗（像按鍵精靈），給 niri 的熱鍵綁定用。
+
+用法：
+  rtfs-type [--delay MS] [文字 | --key 組合鍵]...
+      參數依序送出，文字和 --key 可以混著寫。例如：
+        rtfs-type 'workhere' --key enter
+        rtfs-type --key ctrl+shift+v
+      niri 設定裡可以直接寫換行：spawn "rtfs-type" "workhere\\n"（KDL 字串的 \\n 就是換行）。
+      在 shell 裡則用 $'workhere\\n'；本程式不解讀反斜線跳脫，'\\n' 會照字面打出反斜線和 n。
+
+  --delay MS   開始送之前先等多久（預設 300）。熱鍵的修飾鍵（Super、Alt……）在指令開始執行時通常還按著，
+               沒等手放開就送，niri 和程式會看到「修飾鍵 + 字」；這個延遲就是留給手放開的時間。
+  --key 組合鍵  例如 enter、ctrl+c、alt+f4、super+o；修飾鍵 ctrl／shift／alt／super，
+               按鍵名稱見 KEYS（字母、數字、符號字元本身也可以，例如 ctrl+/）。
+
+限制：
+- 只支援 US 鍵盤配置打得出來的 ASCII（英數、符號、空白、換行、Tab）。按鍵是 evdev keycode，
+  經過 seat 目前的鍵盤配置解讀，所以配置不是 US 時符號會打錯。有其他字元就整個不送、exit 2。
+- fcitx5 在中文模式時，送出的字母會被拿去組字；要先切到英文。
+
+按鍵由同目錄的 rtfs-vkbd 送出（virtual-keyboard 協定，只送 key 事件，原因見它的說明）。
+exit code：0 完成，1 rtfs-vkbd 失敗（例如連不上 compositor），2 參數錯誤。
+""")
+
+SETTLE_MS = 50  # rtfs-vkbd 啟動後至少等這麼久才送第一個鍵
+EVENT_GAP_MS = 5  # 每個 press／release 之間的間隔
+
+# evdev keycode（linux/input-event-codes.h）
+MODIFIERS = {"ctrl": 29, "shift": 42, "alt": 56, "super": 125}
+KEYS = {
+    "esc": 1, "escape": 1, "backspace": 14, "tab": 15, "enter": 28, "return": 28, "space": 57,
+    "capslock": 58, "home": 102, "up": 103, "pageup": 104, "left": 105, "right": 106, "end": 107,
+    "down": 108, "pagedown": 109, "insert": 110, "delete": 111, "del": 111,
+    **{f"f{i}": 58 + i for i in range(1, 11)}, "f11": 87, "f12": 88,
+}
+
+# US 配置：字元 → (keycode, 要不要 Shift)
+CHARS = {"\n": (28, False), "\t": (15, False), " ": (57, False)}
+for row, first in (("1234567890", 2), ("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)):
+    for i, c in enumerate(row):
+        CHARS[c] = (first + i, False)
+        if c.isalpha():
+            CHARS[c.upper()] = (first + i, True)
+for plain, shifted, code in (
+    ("-", "_", 12), ("=", "+", 13), ("[", "{", 26), ("]", "}", 27), (";", ":", 39), ("'", '"', 40),
+    ("`", "~", 41), ("\\", "|", 43), (",", "<", 51), (".", ">", 52), ("/", "?", 53),
+):
+    CHARS[plain] = (code, False)
+    CHARS[shifted] = (code, True)
+for c, code in zip("!@#$%^&*()", range(2, 12)):
+    CHARS[c] = (code, True)
+
+
+def tap(code, mods=()):
+    """一次按鍵：依序按下修飾鍵、按鍵，再反向放開。"""
+    lines = [f"press {m}" for m in mods] + [f"press {code}", f"release {code}"]
+    return lines + [f"release {m}" for m in reversed(mods)]
+
+
+def text_lines(text):
+    lines = []
+    for c in text:
+        if c not in CHARS:
+            raise ValueError(tr("無法輸入的字元 %1（只支援 US 配置的 ASCII）", repr(c)))
+        code, shift = CHARS[c]
+        lines += tap(code, [MODIFIERS["shift"]] if shift else [])
+    return lines
+
+
+def key_lines(combo):
+    combo = combo.lower()
+    if combo.endswith("+"):  # 按鍵本身是 +，例如 ctrl++
+        mods, key = [m for m in combo[:-1].split("+") if m], "+"
+    else:
+        *mods, key = combo.split("+")
+    codes = []
+    for m in mods:
+        if m not in MODIFIERS:
+            raise ValueError(tr("不認得的修飾鍵 %1（可用 %2）", repr(m), ", ".join(MODIFIERS)))
+        codes.append(MODIFIERS[m])
+    if key in KEYS:
+        code = KEYS[key]
+    elif len(key) == 1 and key in CHARS:
+        code, shift = CHARS[key]
+        if shift and MODIFIERS["shift"] not in codes:
+            codes.append(MODIFIERS["shift"])
+    else:
+        raise ValueError(tr("不認得的按鍵 %1", repr(key)))
+    return tap(code, codes)
+
+
+def parse(argv):
+    delay = 300
+    lines = []
+    args = iter(argv)
+    options = True
+    for arg in args:
+        if options and arg in ("-h", "--help"):
+            print(USAGE.strip())
+            sys.exit(0)
+        if options and arg == "--":
+            options = False
+        elif options and arg in ("--delay", "--key", "-k"):
+            value = next(args, None)
+            if value is None:
+                raise ValueError(tr("%1 後面少了值", arg))
+            if arg == "--delay":
+                if not value.isdigit():
+                    raise ValueError(tr("--delay 要是毫秒數：%1", repr(value)))
+                delay = int(value)
+            else:
+                lines += key_lines(value)
+        elif options and arg.startswith("-") and arg != "-":
+            raise ValueError(tr("不認得的選項 %1（要送以 - 開頭的文字，先寫 --）", repr(arg)))
+        else:
+            lines += text_lines(arg)
+    return delay, lines
+
+
+def main():
+    try:
+        delay, lines = parse(sys.argv[1:])
+    except ValueError as e:
+        print(f"rtfs-type: {e}", file=sys.stderr)
+        return 2
+    if not lines:
+        return 0
+    vkbd = os.path.join(os.path.dirname(os.path.realpath(__file__)), "rtfs-vkbd")
+    proc = subprocess.Popen([vkbd], stdin=subprocess.PIPE, text=True)
+    # 先啟動再等：剛建立的虛擬鍵盤要一點時間才就緒，一啟動就送，開頭幾個鍵會掉（實測）。
+    # 所以等待放在啟動之後，至少 SETTLE_MS，跟放開修飾鍵的延遲重疊。
+    time.sleep(max(delay, SETTLE_MS) / 1000)
+    try:
+        for line in lines:
+            proc.stdin.write(line + "\n")
+            proc.stdin.flush()
+            # 一口氣全部送出，程式會掉鍵；每個事件之間稍微停一下。
+            time.sleep(EVENT_GAP_MS / 1000)
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass  # rtfs-vkbd 提早結束（錯誤訊息它自己印），下面看 exit code
+    return 1 if proc.wait() else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,151 @@
+rtfs（Ronmi's Twice Flavored Shell）安裝後的設定
+================================================
+
+套件只負責放檔案。下面這些設定在套件以外，重灌或換電腦時要自己做一次。
+來源是 niri 專案（~/raoh/niri）的設定；有那個專案的話直接用它的設定即可。
+
+
+套件放了什麼
+------------
+
+- /usr/share/rtfs/shell/      QuickShell 設定（shell.qml 與其他 QML）
+- /usr/share/rtfs/scripts/    shell 會呼叫的輔助程式
+- /etc/xdg/quickshell         指向 /usr/share/rtfs/shell 的 symlink，
+                              讓 rtfs 成為 QuickShell 的系統預設設定
+- /usr/bin/rtfs-ui、rtfs-zenity、rtfs-pinentry、rtfs-type
+- /usr/share/doc/rtfs/examples/config.example.yaml   所有設定項目與說明
+
+`qs` 找預設設定時先看 ~/.config/quickshell，沒有才用 /etc/xdg/quickshell。
+所以只要 ~/.config/quickshell 存在（例如開發用的 symlink），套件裝的版本就不會被用到。
+
+
+niri 設定（~/.config/niri/config.kdl）
+-------------------------------------
+
+必要：
+
+    // 登入時啟動 rtfs；只在 niri 下啟動，GNOME session 不受影響。
+    spawn-at-startup "qs" "-n"
+
+    // rtfs-ui／rtfs-zenity 的對話框一律浮動。
+    window-rule {
+        match app-id=r#"^org\.quickshell$"#
+        open-floating true
+    }
+
+    // 桌布也顯示在 overview 的背景。
+    layer-rule {
+        match namespace="^wallpaper$"
+        place-within-backdrop true
+    }
+
+    binds {
+        Mod+D { spawn "qs" "ipc" "call" "launcher" "toggle"; }
+        Mod+N { spawn "qs" "ipc" "call" "notifications" "toggleCenter"; }
+        // qs 沒在跑時退回 swaylock，確保一定鎖得起來。
+        Super+Alt+L { spawn-sh "qs ipc call lock lock || swaylock"; }
+    }
+
+可以反折的筆電（平板模式）：
+
+    switch-events {
+        tablet-mode-on { spawn "sh" "-c" "echo 1 > \"$XDG_RUNTIME_DIR/rtfs-tablet-mode\"; qs ipc call shell setTabletMode true"; }
+        tablet-mode-off { spawn "sh" "-c" "echo 0 > \"$XDG_RUNTIME_DIR/rtfs-tablet-mode\"; qs ipc call shell setTabletMode false"; }
+    }
+
+平板模式時內建螢幕會自動旋轉（主選單的「自動旋轉」可以手動開關），
+需要 iio-sensor-proxy（套件建議安裝）；沒有加速度計的機器上這個功能不會出現。
+
+主選單可以綁快捷鍵：`qs ipc call menu toggle`（另有 open、close），例如
+    Mod+Escape { spawn "qs" "ipc" "call" "menu" "toggle"; }
+niri 預設把 Mod+Escape 綁在 toggle-keyboard-shortcuts-inhibit，要把它改到別的鍵
+（例如 Mod+Shift+Escape，保留 allow-inhibiting=false）。
+
+螢幕鍵盤是 rtfs 內建的（狀態列按鈕，或 `qs ipc call osk toggle`，可以綁快捷鍵），
+不需要 wvkbd。它用 virtual-keyboard 協定送鍵，要能切換 fcitx5 輸入法、觸發 niri 快捷鍵，
+niri 必須包含 PR #4548（v26.04 之後的版本）。
+
+改完記得 `niri validate`。
+
+rtfs 取代了 waybar、swaync、swaybg、fuzzel、swaylock（保留當備援）、
+polkit agent；新機器不要再啟動它們。
+
+
+Framework 筆電的麥克風開關
+------------------------
+
+狀態列在麥克風接通時顯示麥克風圖示。Framework 筆電的硬體麥克風開關要從 EC
+（/dev/cros_ec）讀，這個裝置預設只有 root 能開；沒有權限時當作沒有開關，有接麥克風就顯示。
+套件不自動開放 EC 權限（能開就能送任何 EC 指令）。需要的話自己加 udev 規則，
+例如 /etc/udev/rules.d/60-rtfs-cros-ec.rules：
+
+    KERNEL=="cros_ec", TAG+="uaccess"
+
+（裝了 yafi 的話它已經帶了一樣的規則。）
+
+
+polkit
+------
+
+rtfs 本身就是 polkit 驗證視窗，一個 session 只能有一個。如果裝了 MATE 的
+polkit agent，它會透過 xdg autostart 在 niri 下啟動並搶先註冊。停用方式：
+把 /etc/xdg/autostart/polkit-mate-authentication-agent-1.desktop 複製到
+~/.config/autostart/，把其中的 `NotShowIn=GNOME;KDE;` 改成
+`NotShowIn=GNOME;KDE;niri;`。
+
+
+pinentry（gpg）
+---------------
+
+套件把 rtfs-pinentry 註冊成 pinentry alternative（優先權 95，高於
+pinentry-gnome3），所以 gpg-agent 預設的 /usr/bin/pinentry 就是它，不用改
+~/.gnupg/gpg-agent.conf（已經裝好的 gpg-agent 要 `gpgconf --kill gpg-agent`
+才會重新找 pinentry）。不想用的話：`update-alternatives --config pinentry`。
+
+rtfs-pinentry 只在呼叫端的 Wayland display 上有 rtfs 在跑時才用 rtfs 的
+對話框，其他情況（GNOME、SSH、tty）改用 pinentry alternative 裡的其他程式：
+手動選了哪個就用哪個，否則用優先權最高的（通常是 pinentry-gnome3）。
+
+
+使用者設定
+----------
+
+設定檔是 ~/.config/rtfs/config.yaml，每台機器各自一份，不存在時全部用預設值。
+可以從系統選單（狀態列的電源圖示）的設定按鈕用視窗修改，或參考
+/usr/share/doc/rtfs/examples/config.example.yaml 直接編輯。
+
+預設值不綁特定機器，常見的個人化項目：
+- bar.output：狀態列放在哪個螢幕（預設第一個螢幕）
+- appearance.wallpaper.dirs：桌布圖片目錄（預設沒有，用官方漸層色當背景）
+- appearance.fonts：狀態列與介面字型（預設 sans-serif，由 fontconfig 挑）
+- launcher.terminal：終端機（預設 x-terminal-emulator -e）
+
+
+配色
+----
+
+rtfs 的配色（shell/Colors.qml）跟著套件走。同一套配色也產生給其他程式用，
+放在 /usr/share/rtfs/theme，想讓整個桌面一致的話自己接上：
+
+    # GTK 3／4（libadwaita、adw-gtk3 的具名顏色）
+    ln -s /usr/share/rtfs/theme/gtk3.css ~/.config/gtk-3.0/gtk.css
+    ln -s /usr/share/rtfs/theme/gtk4.css ~/.config/gtk-4.0/gtk.css
+
+    # Qt 6（qt6ct）：~/.config/qt6ct/qt6ct.conf 的 [Appearance]
+    color_scheme_path=/usr/share/rtfs/theme/qt6ct/twice.conf
+    custom_palette=true
+    # 並在 niri 的 environment 設 QT_QPA_PLATFORMTHEME "qt6ct"
+
+    // niri 視窗外框（官方漸層）：config.kdl 的 layout 區塊之後
+    include "/usr/share/rtfs/theme/niri-colors.kdl"
+
+GTK 的 gtk.css 在 GNOME 下也會生效。配色來源是專案的 theme/palette.sh，
+改完執行 scripts/theme-gen 重新產生（只在專案裡用，沒有包進套件）。
+
+
+介面語言
+--------
+
+介面原文是繁體中文。其他語言的對照表放在 /usr/share/rtfs/shell/i18n/<語言>.json，
+依 LANGUAGE、LC_ALL、LC_MESSAGES、LANG 挑選；沒有對應的檔案就顯示原文。
+新增語言的方法見該目錄的 README.md（產生對照表的 scripts/i18n-update 在專案裡）。

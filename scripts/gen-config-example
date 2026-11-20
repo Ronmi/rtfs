@@ -1,0 +1,56 @@
+#!/usr/bin/python3 -I
+"""由 shell/ConfigSchema.js 產生專案根目錄的 config.example.yaml。改了 schema 之後執行一次。"""
+import json
+import os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MARK = "var schema ="
+
+HEADER = """\
+# rtfs 使用者設定範例（由 scripts/gen-config-example 依 shell/ConfigSchema.js 產生，不要直接修改）。
+# 複製到 ~/.config/rtfs/config.yaml 再修改（每台機器各自一份），或用系統選單的設定按鈕修改。
+# 存檔後立即生效。沒寫的項目用預設值（就是這份範例裡的值）；寫錯的項目也會改用預設值並發通知。
+"""
+
+
+def scalar(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    # JSON 字串也是合法的 YAML，特殊字元不用另外處理。
+    return json.dumps(v, ensure_ascii=False)
+
+
+def emit(nodes, indent, out):
+    pad = "  " * indent
+    for key, node in nodes.items():
+        comments = [node["label"] + ("：" + node["desc"] if node.get("desc") else "")]
+        if node.get("type") == "enum":
+            comments += [f"  {c['value']}：{c['label']}" for c in node["choices"]]
+        elif node.get("type") in ("int", "number") and "min" in node:
+            comments.append(f"  範圍 {node['min']}～{node['max']}")
+        out += [pad + "# " + c for c in comments]
+        if "items" in node:
+            out.append(f"{pad}{key}:")
+            emit(node["items"], indent + 1, out)
+        elif node["type"] == "list":
+            out.append(f"{pad}{key}:")
+            out += [f"{pad}  - {scalar(v)}" for v in node["default"]]
+        else:
+            out.append(f"{pad}{key}: {scalar(node['default'])}")
+        if indent == 0:
+            out.append("")
+
+
+def main():
+    with open(os.path.join(ROOT, "shell", "ConfigSchema.js"), encoding="utf-8") as f:
+        text = f.read()
+    schema = json.loads(text[text.index(MARK) + len(MARK):].strip().rstrip(";"))
+    out = [HEADER]
+    emit(schema, 0, out)
+    with open(os.path.join(ROOT, "config.example.yaml"), "w", encoding="utf-8") as f:
+        f.write("\n".join(out).rstrip("\n") + "\n")
+
+
+main()

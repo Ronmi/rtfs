@@ -1,0 +1,158 @@
+# rtfs 使用者設定範例（由 scripts/gen-config-example 依 shell/ConfigSchema.js 產生，不要直接修改）。
+# 複製到 ~/.config/rtfs/config.yaml 再修改（每台機器各自一份），或用系統選單的設定按鈕修改。
+# 存檔後立即生效。沒寫的項目用預設值（就是這份範例裡的值）；寫錯的項目也會改用預設值並發通知。
+
+# 外觀
+appearance:
+  # 桌布
+  wallpaper:
+    # 圖片目錄：只看第一層；jpg、jpeg、png、webp。設定視窗裡一行一個。沒有設定時用官方漸層色當背景。
+    dirs:
+    # 自動輪換：關掉時啟動時挑一次，之後只有 wp next 會換。
+    rotate: true
+    # 輪換間隔（秒）
+    #   範圍 10～86400
+    interval: 900
+    # 順序
+    #   shuffle：隨機（全部輪過一次才重新打亂）
+    #   sequential：照檔名順序
+    order: "shuffle"
+    # 多個螢幕
+    #   different：每個螢幕各一張
+    #   same：所有螢幕同一張
+    perOutput: "different"
+    # 縮放方式
+    #   crop：填滿螢幕，多的裁掉
+    #   fit：完整顯示，留邊
+    #   stretch：拉伸
+    fill: "crop"
+    # 過場
+    transition:
+      # 過場效果
+      #   fade：淡入淡出
+      #   slide：推入
+      #   wipe：擦除
+      #   random：每次隨機挑一種
+      #   none：直接換
+      type: "fade"
+      # 過場長度（毫秒）
+      #   範圍 0～10000
+      duration: 800
+  # 字型
+  fonts:
+    # 狀態列字型：狀態列色塊的文字，也用在鎖定畫面的時鐘。可以用 sans-serif、serif 這類通用名稱，由 fontconfig 挑實際的字型。
+    barFamily: "sans-serif"
+    # 狀態列字級（px）：色塊高度不會跟著變，太大會被切掉。
+    #   範圍 8～32
+    barSize: 16
+    # 介面字型：面板、選單、對話框、提示框的文字。可以用 sans-serif、serif 這類通用名稱，由 fontconfig 挑實際的字型。
+    uiFamily: "sans-serif"
+    # 介面字級（px）：面板、對話框裡的文字以 14 為基準等比例縮放（14 就是原本的大小）。面板寬度不會跟著變，太大可能會被切掉。
+    #   範圍 8～32
+    uiSize: 14
+
+# 狀態列
+bar:
+  # 螢幕：狀態列、通知、螢幕鍵盤放在這個螢幕；OSD、對話框找不到聚焦的螢幕時也用它。空白或這個螢幕沒接上時用第一個螢幕。
+  output: ""
+  # 位置
+  #   top：上緣
+  #   bottom：下緣
+  position: "top"
+  # 時鐘格式：Qt 的日期時間格式（yyyy 年、MM 月、dd 日、ddd 星期、HH 時、mm 分、ss 秒）。
+  clockFormat: "yyyy/MM/dd HH:mm"
+  # 更新頻率
+  interval:
+    # 網速（秒）
+    #   範圍 1～60
+    network: 3
+    # 溫度、風扇、負載（秒）
+    #   範圍 1～60
+    sensors: 3
+  # 電池：主選單色塊與選單裡電池列的低電量顯示。
+  battery:
+    # 警告門檻（%）：筆電電量低於等於這個值（且沒在充電）時，狀態列系統選單的電量變成彩瑛紅並換成警示圖示；選單裡的電池列變成志效黃。
+    #   範圍 1～100
+    warning: 30
+    # 危險門檻（%）：電量低於等於這個值時，選單裡的電池列變成彩瑛紅。
+    #   範圍 1～100
+    critical: 15
+
+# 通知
+notifications:
+  # 彈出秒數：程式沒指定時，一般與低緊急程度的通知顯示幾秒；緊急通知一直留著。
+  #   範圍 1～120
+  timeout: 5
+  # OSD
+  osd:
+    # 顯示秒數
+    #   範圍 0.5～10
+    timeout: 1.5
+    # 位置
+    #   top-left：左上
+    #   top：上方
+    #   top-right：右上
+    #   left：左側
+    #   center：正中央
+    #   right：右側
+    #   bottom-left：左下
+    #   bottom：下方
+    #   bottom-right：右下
+    position: "bottom"
+    # 音量、靜音改變時顯示
+    volume: true
+    # 麥克風靜音改變時顯示
+    microphone: true
+    # 亮度改變時顯示
+    brightness: true
+
+# 螢幕鎖定
+lock:
+  # 背景：用該螢幕目前的桌布。模糊需要 qml6-module-qtquick-effects 套件；沒裝時自動改用變暗。
+  #   dim：變暗
+  #   blur：模糊再變暗
+  background: "dim"
+  # 閒置多久後鎖定（秒）：0 表示不自動鎖定。播放影片等程式要求保持喚醒時不算閒置。
+  #   範圍 0～7200
+  idleLock: 300
+  # 鎖定後閒置多久關掉螢幕（秒）：手動鎖定也算；動一下滑鼠或鍵盤就會亮。0 表示不關。
+  #   範圍 0～3600
+  screenOff: 30
+  # 睡眠、休眠前先鎖定
+  beforeSleep: true
+  # 時鐘格式：Qt 的日期時間格式（yyyy 年、MM 月、dd 日、ddd 星期、HH 時、mm 分、ss 秒）。
+  clockFormat: "HH:mm"
+
+# 啟動器
+launcher:
+  # 終端機指令：執行需要終端機的程式（Terminal=true）時用；程式的指令接在後面，用空白分隔。預設是 Debian 的 x-terminal-emulator（update-alternatives 選的終端機）；例如 kitty --、foot、alacritty -e。
+  terminal: "x-terminal-emulator -e"
+  # overview 的「所有程式」按鈕：niri overview 開著時，每個螢幕上方中央顯示一個開啟啟動器的按鈕。
+  #   never：不顯示
+  #   tablet：只在平板模式顯示
+  #   always：一律顯示
+  overviewButton: "tablet"
+  # 不顯示啟動器的螢幕：啟動器會在每個螢幕顯示，每頁格子數由狀態列所在的螢幕決定；其他螢幕得把格子縮太小才放得下時（例如長條螢幕）自動改顯示遮罩。這裡列出的螢幕也一律顯示遮罩。設定視窗裡一行一個螢幕名稱（例如 DP-3）；狀態列所在的螢幕一律顯示，沒接上的螢幕忽略。
+  excludeOutputs:
+
+# 螢幕鍵盤
+osk:
+  # 半透明時的不透明度（%）：按鍵盤上的 ◐ 切換半透明；數字越小越透明。
+  #   範圍 10～100
+  opacity: 80
+  # 在頂部時也讓視窗縮開：關閉時鍵盤浮在視窗上面、不推動任何東西：固定高度的面板（例如 kitty quick-access-terminal）被推動只會跑出螢幕，不如露出它下方的內容。
+  topReserve: false
+  # 切到頂部時自動打開半透明：只在頂部不讓視窗縮開時有效；之後仍可按 ◐ 關掉。
+  topTranslucent: true
+  # 對話框、鎖定畫面上的螢幕鍵盤按鈕：密碼等對話框和鎖定畫面會蓋住狀態列，所以在畫面右下角另外放一顆開關螢幕鍵盤的按鈕。
+  #   always：一律顯示（每個螢幕）
+  #   tablet：只在平板模式（每個螢幕）
+  #   never：不顯示
+  modalButton: "tablet"
+
+# 使用者
+user:
+  # 顯示名稱：系統選單上顯示的名稱。空白時用帳號資料裡的全名，沒有全名就用帳號。
+  name: ""
+  # 頭像：圖片檔的路徑（可以用 ~/ 開頭）。空白或讀不到時，依序找 /var/lib/AccountsService/icons/帳號、~/.face。
+  avatar: ""

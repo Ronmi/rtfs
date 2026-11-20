@@ -1,0 +1,148 @@
+#!/usr/bin/python3 -I
+"""螢幕鍵盤的送鍵程式（由 shell 的 Osk 啟動，不是給人直接執行的）。
+
+QuickShell 沒有 virtual-keyboard 協定可用，所以由這裡當一個小 Wayland client，
+用 zwp_virtual_keyboard_v1 把按鍵送給 compositor。只用標準函式庫，自己講 Wayland 的 wire protocol。
+
+刻意的做法（見 memory osk）：
+- keymap 用 no_keymap 格式，沿用 seat 目前的鍵盤配置，keycode 就是 evdev keycode。
+- 只送 key 事件，修飾鍵也是真的按下／放開（例如 Ctrl 是 29），從不送 modifiers 請求：
+  smithay 的 modifiers 是絕對值、跟實體鍵盤共用狀態，wvkbd 用它就會出現 Ctrl 狀態跟畫面對不上。
+  只送 key 時 niri 把它當成真的鍵盤，快捷鍵、fcitx5 的 keyboard grab 都看得到。
+- 結束時（stdin 關閉、shell 當掉）compositor 會自動放開還按著的鍵。
+
+協定（stdin 一行一個）：
+  press <keycode>
+  release <keycode>
+錯誤訊息寫到 stderr，連不上 compositor 或缺協定時以非 0 結束。
+"""
+import array
+import os
+import select
+import socket
+import struct
+import sys
+import time
+
+WL_DISPLAY = 1
+
+
+class Wayland:
+    def __init__(self):
+        name = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+        path = name if name.startswith("/") else os.path.join(os.environ["XDG_RUNTIME_DIR"], name)
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(path)
+        self.next_id = 2
+        self.buf = b""
+
+    def new_id(self):
+        i = self.next_id
+        self.next_id += 1
+        return i
+
+    def send(self, obj, opcode, args=b"", fds=()):
+        msg = struct.pack("=II", obj, (8 + len(args)) << 16 | opcode) + args
+        if fds:
+            self.sock.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))])
+        else:
+            self.sock.sendall(msg)
+
+    def read_events(self):
+        """讀進目前收到的資料，回傳完整的 (object, opcode, payload) 清單。"""
+        # 這裡用到的事件都不帶 fd；萬一有（例如 keymap），收下後立刻關掉免得洩漏。
+        data, ancdata, _, _ = self.sock.recvmsg(65536, socket.CMSG_SPACE(16 * 4))
+        for level, kind, payload in ancdata:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                for fd in array.array("i", payload[: len(payload) - len(payload) % 4]):
+                    os.close(fd)
+        if not data:
+            sys.exit("rtfs-vkbd: compositor closed the connection")
+        self.buf += data
+        events = []
+        while len(self.buf) >= 8:
+            obj, word = struct.unpack_from("=II", self.buf)
+            size = word >> 16
+            if len(self.buf) < size:
+                break
+            events.append((obj, word & 0xFFFF, self.buf[8:size]))
+            self.buf = self.buf[size:]
+        for obj, opcode, payload in events:
+            if obj == WL_DISPLAY and opcode == 0:  # wl_display.error
+                _, code = struct.unpack_from("=II", payload)
+                sys.exit(f"rtfs-vkbd: protocol error {code}: {string_arg(payload, 8)}")
+        return events
+
+
+def string_arg(payload, offset):
+    (length,) = struct.unpack_from("=I", payload, offset)
+    return payload[offset + 4 : offset + 4 + length - 1].decode()
+
+
+def pack_string(s):
+    b = s.encode() + b"\0"
+    return struct.pack("=I", len(b)) + b + b"\0" * (-len(b) % 4)
+
+
+def main():
+    wl = Wayland()
+
+    # 列出 globals，再用 sync 等到列完。
+    registry = wl.new_id()
+    wl.send(WL_DISPLAY, 1, struct.pack("=I", registry))  # get_registry
+    callback = wl.new_id()
+    wl.send(WL_DISPLAY, 0, struct.pack("=I", callback))  # sync
+    globals_ = {}
+    done = False
+    while not done:
+        for obj, opcode, payload in wl.read_events():
+            if obj == registry and opcode == 0:  # global
+                (name,) = struct.unpack_from("=I", payload)
+                interface = string_arg(payload, 4)
+                globals_.setdefault(interface, name)
+            elif obj == callback and opcode == 0:  # done
+                done = True
+
+    for needed in ("wl_seat", "zwp_virtual_keyboard_manager_v1"):
+        if needed not in globals_:
+            sys.exit(f"rtfs-vkbd: compositor does not offer {needed}")
+
+    def bind(interface, version):
+        new = wl.new_id()
+        wl.send(registry, 0, struct.pack("=I", globals_[interface]) + pack_string(interface)
+                + struct.pack("=II", version, new))
+        return new
+
+    seat = bind("wl_seat", 1)
+    manager = bind("zwp_virtual_keyboard_manager_v1", 1)
+    keyboard = wl.new_id()
+    wl.send(manager, 0, struct.pack("=II", seat, keyboard))  # create_virtual_keyboard
+    # keymap(format=no_keymap, fd, size=0)：協定仍要求一個 fd，給 /dev/null（fd 不佔訊息內容）。
+    with open(os.devnull, "rb") as null:
+        wl.send(keyboard, 0, struct.pack("=II", 0, 0), fds=[null.fileno()])
+
+    start = time.monotonic()
+    stdin = sys.stdin.buffer
+    pending = b""
+    while True:
+        ready, _, _ = select.select([stdin, wl.sock], [], [])
+        if wl.sock in ready:
+            wl.read_events()  # 只是清掉 seat 的事件、檢查錯誤
+        if stdin in ready:
+            chunk = os.read(stdin.fileno(), 4096)
+            if not chunk:
+                return
+            pending += chunk
+            *lines, pending = pending.split(b"\n")
+            for line in lines:
+                parts = line.split()
+                if len(parts) != 2 or parts[0] not in (b"press", b"release") or not parts[1].isdigit():
+                    print(f"rtfs-vkbd: bad command {line!r}", file=sys.stderr)
+                    continue
+                ms = int((time.monotonic() - start) * 1000) & 0xFFFFFFFF
+                state = 1 if parts[0] == b"press" else 0
+                wl.send(keyboard, 1, struct.pack("=III", ms, int(parts[1]), state))  # key
+
+
+if __name__ == "__main__":
+    main()

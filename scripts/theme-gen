@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# 從 theme/palette.sh（唯一的色彩來源）重新產生各元件的配色檔，讓 rtfs、GTK、Qt、niri 用同一套顏色：
+#   shell/Colors.qml           rtfs 的 Colors singleton（palette.sh 每個變數一個屬性）
+#   theme/gtk3.css、gtk4.css    GTK 具名顏色（~/.config/gtk-{3,4}.0/gtk.css 指向它們）
+#   theme/qt6ct/twice.conf     qt6ct 配色（qt6ct.conf 的 color_scheme_path 指向它）
+#   theme/niri-colors.kdl      niri 視窗外框（config.kdl 在 layout 之後 include 它）
+# 套件把 theme/ 的產生檔裝到 /usr/share/rtfs/theme；用法見 debian/README.Debian。
+# 這個腳本只在開發時執行（會改寫 repo 裡的檔案），不放進套件。執行中的 GTK 程式要重開才會套用。
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+THEME_DIR="$ROOT/theme"
+# shellcheck source=../theme/palette.sh
+source "$THEME_DIR/palette.sh"
+
+# libadwaita / adw-gtk3 具名顏色 → 色板角色（淺色）
+gtk_colors=(
+    "window_bg_color $BG"           "window_fg_color $FG"
+    "view_bg_color $VIEW"           "view_fg_color $FG"
+    "headerbar_bg_color $HEADER"    "headerbar_fg_color $FG"
+    "headerbar_backdrop_color $BG"  "headerbar_border_color $FG"
+    "headerbar_shade_color rgba(0,0,0,0.12)"
+    "headerbar_darker_shade_color rgba(0,0,0,0.12)"
+    "sidebar_bg_color $SIDEBAR"     "sidebar_fg_color $FG"
+    "sidebar_backdrop_color $BG"    "sidebar_border_color rgba(0,0,0,0.07)"
+    "sidebar_shade_color rgba(0,0,0,0.07)"
+    "secondary_sidebar_bg_color $SIDEBAR" "secondary_sidebar_fg_color $FG"
+    "secondary_sidebar_backdrop_color $BG" "secondary_sidebar_border_color rgba(0,0,0,0.07)"
+    "secondary_sidebar_shade_color rgba(0,0,0,0.07)"
+    "card_bg_color $VIEW"           "card_fg_color $FG"
+    "card_shade_color rgba(0,0,0,0.07)"
+    "dialog_bg_color $BG"           "dialog_fg_color $FG"
+    "popover_bg_color $VIEW"        "popover_fg_color $FG"
+    "popover_shade_color rgba(0,0,0,0.07)"
+    "thumbnail_bg_color $VIEW"      "thumbnail_fg_color $FG"
+    "shade_color rgba(0,0,0,0.07)"
+    "scrollbar_outline_color $VIEW"
+    "accent_bg_color $ACCENT"       "accent_fg_color $ACCENT_FG"
+    "accent_color $ACCENT_TEXT"
+    "destructive_bg_color $ERR"     "destructive_fg_color $INK_LIGHT"
+    "destructive_color $ERR_TEXT"
+    "error_bg_color $ERR"           "error_fg_color $INK_LIGHT"
+    "error_color $ERR_TEXT"
+    "warning_bg_color $WARN"        "warning_fg_color $INK_DARK"
+    "warning_color $WARN_TEXT"
+    "success_bg_color $OK"          "success_fg_color $INK_DARK"
+    "success_color $OK_TEXT"
+    # GTK3 舊名稱（adw-gtk3 的 GTK3 部分仍會用到）
+    "theme_selected_bg_color $SEL"  "theme_selected_fg_color $SEL_FG"
+    "theme_unfocused_selected_bg_color $SEL" "theme_unfocused_selected_fg_color $SEL_FG"
+)
+
+header="/* 由 rtfs 的 scripts/theme-gen 從 theme/palette.sh 產生，請勿手動編輯。 */"
+
+define_colors() {
+    local pair
+    for pair in "${gtk_colors[@]}"; do
+        printf '@define-color %s %s;\n' "${pair%% *}" "${pair#* }"
+    done
+}
+
+# GTK3／GTK4 共用的規則。
+shared_rules() {
+    cat <<EOF
+
+/* 選取一律用 SEL 實色填滿（libadwaita 預設用強調色的半透明）。 */
+selection { background-color: $SEL; color: $SEL_FG; }
+
+/* libadwaita／adw-gtk3 的 tooltip 寫死半透明黑，不吃具名顏色；改成深色外殼色。 */
+tooltip.background { background-color: $SHELL_RAISED; color: $SHELL_FG; }
+EOF
+}
+
+{
+    echo "$header"
+    define_colors
+    shared_rules
+} > "$THEME_DIR/gtk3.css"
+
+{
+    echo "$header"
+    define_colors
+    # libadwaita 1.6+ 改用 CSS 變數，具名顏色只是相容用，兩種都要給。
+    echo
+    echo ":root {"
+    for pair in "${gtk_colors[@]}"; do
+        name="${pair%% *}"
+        printf '    --%s: %s;\n' "${name//_/-}" "${pair#* }"
+    done
+    echo "}"
+    shared_rules
+    # libadwaita 的側欄選取／hover 是文字色半透明疊加（灰），圖示格與列表選取是強調色 25%；
+    # 統一改成 SEL 色系：選取用實色，hover 用淡色。設定頁的卡片列表不動。
+    cat <<EOF
+
+.navigation-sidebar row.activatable:hover, .navigation-sidebar child.activatable:hover,
+.navigation-sidebar flowboxchild:hover, gridview > child.activatable:hover,
+listview > row.activatable:hover {
+    background-color: color-mix(in srgb, $SEL 45%, transparent);
+}
+.navigation-sidebar row:selected, .navigation-sidebar child:selected,
+.navigation-sidebar flowboxchild:selected, flowbox > flowboxchild:selected,
+gridview > child:selected, listview > row:selected {
+    background-color: $SEL;
+    color: $SEL_FG;
+}
+.navigation-sidebar row.activatable:selected:hover, .navigation-sidebar child.activatable:selected:hover,
+.navigation-sidebar flowboxchild:selected:hover, gridview > child.activatable:selected:hover,
+listview > row.activatable:selected:hover {
+    background-color: color-mix(in srgb, $SEL 88%, white);
+}
+.navigation-sidebar row.activatable:selected:active, .navigation-sidebar child.activatable:selected:active,
+.navigation-sidebar flowboxchild:selected:active, gridview > child.activatable:selected:active,
+listview > row.activatable:selected:active {
+    background-color: color-mix(in srgb, $SEL 80%, white);
+}
+EOF
+} > "$THEME_DIR/gtk4.css"
+
+# qt6ct 配色：21 個顏色，依 QPalette::ColorRole 順序
+# (WindowText Button Light Midlight Dark Mid Text BrightText ButtonText Base Window
+#  Shadow Highlight HighlightedText Link LinkVisited AlternateBase NoRole
+#  ToolTipBase ToolTipText PlaceholderText)
+# Fusion 用 Light/Midlight/Dark/Mid/Shadow 畫立體邊框，這幾個是 Qt 專用的灰階。
+qt_colors() {
+    local text=$1 c out=()
+    for c in "$text" "$BUTTON" "#FFFFFF" "$SIDEBAR" "#A0A0A8" "#C8C8CE" "$text" "#FFFFFF" "$text" \
+             "$VIEW" "$BG" "#767676" "$SEL" "$SEL_FG" "$ACCENT_TEXT" "$ACCENT_TEXT" "$SIDEBAR" "$BG" \
+             "$SHELL_RAISED" "$SHELL_FG" "$DIM"; do
+        out+=("#ff${c#\#}")
+    done
+    local IFS=,
+    echo "${out[*]}" | sed 's/,/, /g'
+}
+QT_DIR="$THEME_DIR/qt6ct"
+mkdir -p "$QT_DIR"
+cat > "$QT_DIR/twice.conf" <<EOF
+# 由 rtfs 的 scripts/theme-gen 從 theme/palette.sh 產生，請勿手動編輯。
+[ColorScheme]
+active_colors=$(qt_colors "$FG")
+inactive_colors=$(qt_colors "$FG")
+disabled_colors=$(qt_colors "$DIM")
+EOF
+
+# niri：config.kdl 在 layout 之後 include 這個檔（include 會合併並蓋過先前的設定）
+NIRI_COLORS="$THEME_DIR/niri-colors.kdl"
+cat > "$NIRI_COLORS" <<EOF
+// 由 rtfs 的 scripts/theme-gen 從 theme/palette.sh 產生，請勿手動編輯。
+layout {
+    focus-ring {
+        active-gradient from="$OFFICIAL_FROM" to="$OFFICIAL_TO" angle=45
+        inactive-color "$BORDER_INACTIVE"
+        urgent-color "$ERR"
+    }
+    border {
+        active-gradient from="$OFFICIAL_FROM" to="$OFFICIAL_TO" angle=45
+        inactive-color "$BORDER_INACTIVE"
+        urgent-color "$ERR"
+    }
+}
+EOF
+
+# rtfs：palette.sh 的每個變數都輸出成 Colors singleton 的屬性，名稱轉成 camelCase（SHELL_BG → shellBg）。
+QS_COLORS="$ROOT/shell/Colors.qml"
+qs_props=()
+for role in $(grep -oE '^[A-Z_]+=' "$THEME_DIR/palette.sh" | tr -d =); do
+    name=$(echo "${role,,}" | sed -E 's/_([a-z])/\U\1/g')
+    # QML 把 on + 大寫開頭的名稱當成 signal handler，不能當屬性名稱；寫檔前先擋下，以免留下壞檔。
+    if [[ $name =~ ^on[A-Z] ]]; then
+        echo "palette.sh role $role becomes QML name $name, which QML treats as a signal handler; rename it" >&2
+        exit 1
+    fi
+    qs_props+=("$(printf '    readonly property color %s: "%s"' "$name" "${!role}")")
+done
+{
+    echo "// 由 scripts/theme-gen 從 theme/palette.sh 產生，請勿手動編輯。"
+    echo "pragma Singleton"
+    echo "import QtQuick // 提供 color 型別"
+    echo "import Quickshell"
+    echo
+    echo "Singleton {"
+    printf '%s\n' "${qs_props[@]}"
+    echo "}"
+} > "$QS_COLORS"
+
+echo "Generated:"
+printf '  %s\n' "$QS_COLORS" "$THEME_DIR/gtk3.css" "$THEME_DIR/gtk4.css" "$QT_DIR/twice.conf" "$NIRI_COLORS"

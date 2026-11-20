@@ -1,0 +1,5 @@
+usr/share/rtfs/shell etc/xdg/quickshell
+usr/share/rtfs/scripts/rtfs-ui usr/bin/rtfs-ui
+usr/share/rtfs/scripts/rtfs-zenity usr/bin/rtfs-zenity
+usr/share/rtfs/scripts/rtfs-pinentry usr/bin/rtfs-pinentry
+usr/share/rtfs/scripts/rtfs-type usr/bin/rtfs-type

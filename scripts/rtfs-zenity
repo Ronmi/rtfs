@@ -1,0 +1,940 @@
+#!/usr/bin/python3
+"""rtfs-zenity：zenity 相容的命令列。把參數翻成 rtfs-ui 的 spec，再把結果翻回 zenity 的輸出與 exit code。
+
+相容目標是 zenity 4.1.90：所有參數照 manual（GNOME help）實作，manual 沒寫清楚的行為參考該版原始碼；
+manual 沒提到的邊角情況（例如選項用在不對應的對話框）不特別處理。
+  --info／--warning／--error／--question、--entry、--password、--list、--progress、--scale、--calendar、
+  --text-info、--color-selection、--forms：由 QuickShell 畫（rtfs-ui）
+  --file-selection：rtfs-ui 的 file 容器（目前由 shell 交給 xdg-desktop-portal 顯示）
+  --notification：送到桌面通知（org.freedesktop.Notifications，也就是 QuickShell 的通知）
+跟 zenity 一樣預設開一般視窗；--modal 時改用整個桌面變暗、獨佔鍵盤的 modal。
+
+刻意的差異：
+  - 視窗管理相關的 --attach、位置等沒有效果（Wayland 上由 niri 決定）。
+  - --html 用 Qt 的 rich text 顯示（不跑 JS、不載入外部資源）；--url、--no-interaction 不支援。
+  - 單選清單一開始就選取第一列（Enter 直接選最符合篩選的項目，方便鍵盤操作）。
+  - 預設的標題、文字、按鈕是繁體中文。
+exit code 同 zenity：0 確定、1 取消／關閉／extra button（stdout 印按鈕文字）、5 逾時、255 錯誤；
+可以用環境變數 ZENITY_OK／ZENITY_CANCEL／ZENITY_ESC／ZENITY_EXTRA／ZENITY_ERROR／ZENITY_TIMEOUT
+（或 DIALOG_*）覆寫。
+"""
+
+import datetime
+import json
+import locale
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+# 介面文字翻譯（shell/i18n）。腳本目錄不一定在 sys.path（python3 -I、從 /usr/bin 的 symlink 執行），自己加。
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from rtfs_i18n import tr  # noqa: E402
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+RTFS_UI = os.path.join(HERE, "rtfs-ui")
+# 相容的 zenity 版本（--version 印這個，給檢查版本的腳本用）。
+VERSION = "4.1.90"
+
+MODES = ["calendar", "entry", "error", "info", "file-selection", "list", "notification", "progress",
+         "question", "warning", "scale", "text-info", "color-selection", "password", "forms"]
+
+VALUE_OPTS = {
+    "title", "width", "height", "timeout", "ok-label", "cancel-label", "extra-button", "attach",
+    "window-icon", "icon-name", "icon", "text", "day", "month", "year", "date-format", "entry-text",
+    "filename", "separator", "file-filter", "column", "print-column", "hide-column", "hint",
+    "percentage", "value", "min-value", "max-value", "step", "font", "checkbox", "url", "color",
+    "add-entry", "add-password", "add-multiline-entry", "add-calendar", "add-list", "list-values",
+    "column-values", "add-combo", "combo-values", "forms-date-format",
+}
+BOOL_OPTS = {
+    "modal", "hide-text", "no-wrap", "no-markup", "ellipsize", "multiple", "directory", "save",
+    "confirm-overwrite", "checklist", "radiolist", "imagelist", "editable", "hide-header", "mid-search",
+    "listen", "pulsate", "auto-close", "auto-kill", "no-cancel", "time-remaining", "default-cancel",
+    "switch", "print-partial", "hide-value", "auto-scroll", "html", "no-interaction", "show-palette",
+    "username", "show-header", "about", "version",
+}
+INT_OPTS = {"width", "height", "timeout", "day", "month", "year", "percentage", "value", "min-value",
+            "max-value", "step"}
+# 表單的欄位依參數順序排列，所以另外記下順序。
+FORM_FIELDS = {"add-entry", "add-password", "add-multiline-entry", "add-calendar", "add-list", "add-combo"}
+
+# 預設標題與文字（zenity 的介面字串，翻成繁體中文）。
+HEADINGS = {
+    "info": tr("資訊"), "warning": tr("警告"), "error": tr("錯誤"), "question": tr("問題"), "entry": tr("新增項目"),
+    "calendar": tr("選擇日期"), "list": tr("從清單選擇項目"), "text-info": tr("文字檢視"), "scale": tr("調整數值"),
+    "progress": tr("進度"), "password": tr("密碼"), "forms": tr("表單"), "color-selection": tr("選擇顏色"),
+    "file-selection": tr("選擇檔案"),
+}
+TEXTS = {
+    "info": tr("所有更新已完成。"), "warning": tr("確定要繼續嗎？"), "question": tr("確定要繼續嗎？"),
+    "error": tr("發生錯誤。"), "entry": tr("輸入新的文字："), "calendar": tr("請從下方選擇日期。"),
+    "list": tr("請從下方清單選擇項目。"), "scale": tr("調整數值"), "progress": tr("執行中…"), "forms": tr("表單"),
+}
+OK_LABEL, CANCEL_LABEL, YES_LABEL, NO_LABEL = tr("確定"), tr("取消"), tr("是"), tr("否")
+
+
+# ---------------------------------------------------------------- 共用工具
+
+def exit_code(kind):
+    """zenity 的 exit code，可以用 ZENITY_<KIND> 或 DIALOG_<KIND> 環境變數覆寫。"""
+    defaults = {"OK": 0, "CANCEL": 1, "ESC": 1, "ERROR": -1, "EXTRA": 1, "TIMEOUT": 5}
+    for var in (f"ZENITY_{kind}", f"DIALOG_{kind}"):
+        if var in os.environ:
+            try:
+                return int(os.environ[var])
+            except ValueError:
+                return 1
+    return defaults[kind]
+
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(exit_code("ERROR"))
+
+
+def strcompress(s):
+    """g_strcompress：把 \\n、\\t、\\\\、八進位等跳脫字元換成原字元（zenity 對 --text 等做的事）。"""
+    if "\\" not in s:
+        return s
+    src = s.encode("utf-8")
+    out = bytearray()
+    simple = {ord("b"): 8, ord("f"): 12, ord("n"): 10, ord("r"): 13, ord("t"): 9, ord("v"): 11}
+    i = 0
+    while i < len(src):
+        c = src[i]
+        if c != 0x5C or i + 1 >= len(src):
+            out.append(c)
+            i += 1
+            continue
+        i += 1
+        c = src[i]
+        if 0x30 <= c <= 0x37:
+            n = 0
+            for _ in range(3):
+                if i < len(src) and 0x30 <= src[i] <= 0x37:
+                    n = n * 8 + src[i] - 0x30
+                    i += 1
+            out.append(n & 0xFF)
+            continue
+        out.append(simple.get(c, c))
+        i += 1
+    return out.decode("utf-8", errors="replace")
+
+
+def strip_mnemonic(s):
+    """GTK 的快捷鍵標記：「_A」顯示成「A」，「__」顯示成「_」。"""
+    return re.sub(r"_(.)", r"\1", s)
+
+
+def pango_to_styled(text):
+    """把 Pango markup 轉成 Qt StyledText 認得的寫法（大部份標籤兩邊相同）。
+
+    <span> 的 foreground／color／weight／style／underline 轉成 <font color>／<b>／<i>／<u>；
+    <tt> 換成等寬字型；換行換成 <br>。
+    """
+    stack = []  # 每個還沒關閉的 <span> 要補上的結束標籤
+
+    def span(m):
+        if m.group(0).startswith("</"):
+            return stack.pop() if stack else ""
+        attrs = dict(re.findall(r'([\w-]+)\s*=\s*["\']([^"\']*)["\']', m.group(1)))
+        opening, closing = "", ""
+        color = attrs.get("foreground") or attrs.get("fgcolor") or attrs.get("color")
+        if color:
+            opening += f'<font color="{color}">'
+            closing = "</font>" + closing
+        if attrs.get("weight") in ("bold", "heavy", "ultrabold", "semibold"):
+            opening += "<b>"
+            closing = "</b>" + closing
+        if attrs.get("style") in ("italic", "oblique"):
+            opening += "<i>"
+            closing = "</i>" + closing
+        if attrs.get("underline") not in (None, "none"):
+            opening += "<u>"
+            closing = "</u>" + closing
+        stack.append(closing)
+        return opening
+
+    # re.sub 由左到右處理，所以用堆疊配對巢狀與連續的 span 都正確。
+    out = re.sub(r"</?span\b([^>]*)>", span, text)
+    out = out.replace("<tt>", '<font face="monospace">').replace("</tt>", "</font>")
+    return out.replace("\n", "<br>")
+
+
+class Options:
+    """解析後的參數：values[name] 是該選項所有值的清單（布林選項的值是 True）。"""
+
+    def __init__(self):
+        self.mode = None
+        self.values = {}
+        self.order = []  # 表單欄位的 (選項名稱, 值)，依出現順序
+        self.args = []   # 不是選項的參數（清單的資料、輸入框的候選）
+
+    def has(self, name):
+        return name in self.values
+
+    def get(self, name, default=None):
+        return self.values[name][-1] if name in self.values else default
+
+    def all(self, name):
+        return self.values.get(name, [])
+
+
+def parse(argv):
+    o = Options()
+    i = 0
+    only_args = False
+    while i < len(argv):
+        arg = argv[i]
+        i += 1
+        if only_args or not arg.startswith("-") or arg == "-":
+            o.args.append(arg)
+            continue
+        if arg == "--":
+            only_args = True
+            continue
+        if arg in ("-h", "--help") or arg.startswith("--help-"):
+            print_help()
+            sys.exit(0)
+        name, eq, value = arg[2:].partition("=") if arg.startswith("--") else (arg[1:], "", "")
+        if name in MODES:
+            if o.mode is not None and o.mode != name:
+                die("Two or more dialog options specified")
+            o.mode = name
+            continue
+        if name in VALUE_OPTS:
+            if not eq:
+                if i >= len(argv):
+                    die(f"Missing argument for --{name}")
+                value = argv[i]
+                i += 1
+            if name in INT_OPTS:
+                try:
+                    value = int(value)
+                except ValueError:
+                    die(f"Cannot parse integer value “{value}” for --{name}")
+        elif name in BOOL_OPTS:
+            value = True
+        else:
+            print(f"rtfs-zenity: ignoring unknown option {arg}", file=sys.stderr)
+            continue
+        o.values.setdefault(name, []).append(value)
+        if name in FORM_FIELDS:
+            o.order.append((name, value))
+    return o
+
+
+def print_help():
+    print("""Usage:
+  rtfs-zenity [OPTION…]   (zenity 4.1.90 compatible; see `zenity --help-all` for all options)
+
+Dialog types:
+  --calendar  --entry  --error  --info  --file-selection  --list  --notification  --progress
+  --question  --warning  --scale  --text-info  --color-selection  --password  --forms
+
+Dialogs are drawn by QuickShell (rtfs-ui); --file-selection uses xdg-desktop-portal.""")
+
+
+# ---------------------------------------------------------------- 跟 rtfs-ui 溝通
+
+class UiFailed(Exception):
+    pass
+
+
+class Ui:
+    """執行 `rtfs-ui --stream`：送出 spec 與後續的 update，收中途事件與最終結果。"""
+
+    current = None
+
+    def __init__(self, spec, on_event=None):
+        self.on_event = on_event
+        self.lock = threading.Lock()
+        self.proc = subprocess.Popen([RTFS_UI, "--stream"], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, text=True, bufsize=1)
+        Ui.current = self
+        self.send(spec)
+
+    def send(self, obj):
+        with self.lock:
+            try:
+                self.proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                self.proc.stdin.flush()
+            except (BrokenPipeError, ValueError, OSError):
+                pass  # 對話框已經結束
+
+    def update(self, patch):
+        self.send(patch)
+
+    def close(self):
+        self.send({"close": True})
+
+    def wait(self):
+        for line in self.proc.stdout:
+            msg = json.loads(line)
+            if "event" in msg:
+                if self.on_event:
+                    self.on_event(msg)
+                continue
+            self.proc.wait()
+            return msg
+        raise UiFailed(self.proc.wait())
+
+
+def forward_signal(signum, _frame):
+    # 被 kill 時讓 rtfs-ui 收掉畫面上的對話框（Ctrl-C 的 SIGINT 本來就會送給整個 process group）。
+    if Ui.current is not None:
+        Ui.current.proc.send_signal(signum)
+    else:
+        sys.exit(128 + signum)
+
+
+def base_spec(o, mode):
+    spec = {"title": o.get("title") or HEADINGS.get(mode, "")}
+    if o.has("modal"):
+        spec["container"] = "modal"
+    for k in ("width", "height"):
+        if o.get(k, -1) > 0:
+            spec[k] = o.get(k)
+    if o.get("timeout", 0) > 0:
+        spec["timeout"] = o.get("timeout")
+    return spec
+
+
+def markup_text(o, mode):
+    """--text 經過 g_strcompress 再當 Pango markup（多數對話框的處理方式）。"""
+    return pango_to_styled(strcompress(o.get("text", TEXTS.get(mode, ""))))
+
+
+def extra_buttons(o):
+    return [{"id": f"extra:{n}", "label": label} for n, label in enumerate(o.all("extra-button"))]
+
+
+def ok_cancel(o):
+    return [{"id": "cancel", "label": o.get("cancel-label", CANCEL_LABEL)},
+            {"id": "ok", "label": o.get("ok-label", OK_LABEL), "role": "accept", "default": True}]
+
+
+def run_dialog(spec, o, output=None, timeout_output=False, on_event=None, feeder=None):
+    """顯示對話框並依結果輸出、回傳 exit code。
+
+    output(values)：按下確定時印出結果；timeout_output：逾時時也印（zenity 的清單、輸入框等會這樣）。
+    feeder(ui)：在另一個 thread 持續送 update（例如讀 stdin）。
+    """
+    ui = Ui(spec, on_event)
+    if feeder:
+        threading.Thread(target=feeder, args=(ui,), daemon=True).start()
+    try:
+        result = ui.wait()
+    except UiFailed as e:
+        return 130 if e.args[0] == 130 else exit_code("ERROR")
+    return interpret(result, o, output, timeout_output)
+
+
+def interpret(result, o, output, timeout_output):
+    button, reason = result.get("button"), result.get("reason")
+    values = result.get("values", {})
+    if reason == "timeout":
+        if timeout_output and output:
+            output(values)
+        return exit_code("TIMEOUT")
+    if reason == "closed":
+        return exit_code("OK")
+    if button is None:
+        return exit_code("ESC")
+    if button.startswith("extra:"):
+        print(o.all("extra-button")[int(button[6:])])
+        return exit_code("EXTRA")
+    if button in ("cancel", "no"):
+        return exit_code("CANCEL")
+    if output:
+        output(values)
+    return exit_code("OK")
+
+
+class StdinReader:
+    """背景讀 stdin（一行一筆）。開對話框前先等一下，讓大部份資料一開始就在畫面上。"""
+
+    def __init__(self):
+        self.lines = []
+        self.eof = False
+        self.cond = threading.Condition()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        for line in sys.stdin:
+            with self.cond:
+                self.lines.append(line.rstrip("\n"))
+                self.cond.notify_all()
+        with self.cond:
+            self.eof = True
+            self.cond.notify_all()
+
+    def initial(self, wait=0.3):
+        """等到 EOF 或 wait 秒，取走目前讀到的行。"""
+        end = time.monotonic() + wait
+        with self.cond:
+            while not self.eof and (left := end - time.monotonic()) > 0:
+                self.cond.wait(left)
+            return self.take()
+
+    def take(self):
+        lines, self.lines = self.lines, []
+        return lines
+
+    def batches(self, interval=0.1):
+        """之後陸續讀到的行，每 interval 秒最多一批；EOF 後結束。"""
+        while True:
+            with self.cond:
+                while not self.lines and not self.eof:
+                    self.cond.wait()
+            time.sleep(interval)  # 讓同一段時間到的行一起送
+            with self.cond:
+                lines, eof = self.take(), self.eof
+            if lines:
+                yield lines
+            if eof:
+                return
+
+
+def date_format(o, name):
+    fmt = o.get(name)
+    if fmt:
+        return fmt
+    try:
+        return locale.nl_langinfo(locale.D_FMT)
+    except (AttributeError, ValueError):
+        return "%x"
+
+
+def format_date(iso, fmt):
+    return datetime.date.fromisoformat(iso).strftime(fmt)
+
+
+# ---------------------------------------------------------------- 各種對話框
+
+def mode_message(o, mode):
+    spec = base_spec(o, mode)
+    if o.has("no-markup"):
+        spec["text"] = o.get("text", TEXTS[mode])
+    else:
+        spec["text"] = markup_text(o, mode)
+        spec["markup"] = True
+    if o.has("no-wrap"):
+        spec["wrap"] = False
+    if o.has("ellipsize"):
+        spec["ellipsize"] = True
+    spec["icon"] = o.get("icon") or o.get("icon-name") or o.get("window-icon") or mode
+    if mode == "question":
+        if o.has("switch"):
+            if not o.has("extra-button"):
+                die("--switch requires at least one --extra-button")
+            buttons = []
+        else:
+            default_cancel = o.has("default-cancel")
+            buttons = [{"id": "no", "label": o.get("cancel-label", NO_LABEL), "default": default_cancel},
+                       {"id": "yes", "label": o.get("ok-label", YES_LABEL), "role": "accept",
+                        "default": not default_cancel}]
+    else:
+        buttons = [{"id": "ok", "label": o.get("ok-label", OK_LABEL), "role": "accept", "default": True}]
+    spec["buttons"] = buttons + extra_buttons(o)
+    return run_dialog(spec, o)
+
+
+def mode_entry(o):
+    spec = base_spec(o, "entry")
+    spec["text"] = strip_mnemonic(strcompress(o.get("text", TEXTS["entry"])))
+    field = {"type": "entry", "id": "entry", "password": o.has("hide-text")}
+    entry_text = o.get("entry-text")
+    # 參數（加上 --entry-text）超過一個時是可輸入的下拉選單，--entry-text 排第一個並預設選取。
+    choices = ([entry_text] if entry_text is not None else []) + o.args
+    if len(choices) > 1:
+        field["choices"] = choices
+        field["text"] = choices[0] if entry_text is not None else ""
+    elif entry_text is not None:
+        field["text"] = entry_text
+    spec["fields"] = [field]
+    spec["buttons"] = ok_cancel(o) + extra_buttons(o)
+    return run_dialog(spec, o, lambda v: print(v.get("entry", "")), timeout_output=True)
+
+
+def mode_password(o):
+    spec = base_spec(o, "password")
+    fields = []
+    if o.has("username"):
+        spec["text"] = tr("請輸入使用者名稱和密碼")
+        fields.append({"type": "entry", "id": "user", "label": tr("使用者名稱：")})
+        fields.append({"type": "entry", "id": "pass", "label": tr("密碼："), "password": True})
+    else:
+        spec["text"] = tr("請輸入密碼")
+        fields.append({"type": "entry", "id": "pass", "password": True})
+    spec["fields"] = fields
+    spec["buttons"] = ok_cancel(o) + extra_buttons(o)
+
+    def output(v):
+        print(f"{v.get('user', '')}|{v.get('pass', '')}" if o.has("username") else v.get("pass", ""))
+    return run_dialog(spec, o, output)
+
+
+def mode_calendar(o):
+    spec = base_spec(o, "calendar")
+    spec["text"] = markup_text(o, "calendar")
+    spec["markup"] = True
+    field = {"type": "calendar", "id": "date"}
+    for k in ("year", "month", "day"):
+        if o.has(k):
+            field[k] = o.get(k)
+    spec["fields"] = [field]
+    spec["buttons"] = ok_cancel(o) + extra_buttons(o)
+    fmt = date_format(o, "date-format")
+    return run_dialog(spec, o, lambda v: print(format_date(v["date"], fmt)), timeout_output=True)
+
+
+def mode_scale(o):
+    spec = base_spec(o, "scale")
+    spec["text"] = markup_text(o, "scale")
+    spec["markup"] = True
+    lo, hi, val, step = o.get("min-value", 0), o.get("max-value", 100), o.get("value", 0), o.get("step", 1)
+    if lo >= hi:
+        die("Maximum value must be greater than minimum value.")
+    if not lo <= val <= hi:
+        die("Value out of range.")
+    spec["fields"] = [{"type": "scale", "id": "value", "min": lo, "max": hi, "value": val, "step": step,
+                       "hideValue": o.has("hide-value"), "partial": o.has("print-partial")}]
+    spec["buttons"] = ok_cancel(o) + extra_buttons(o)
+
+    def on_event(e):
+        if e["event"] == "change":
+            print(round(e["value"]), flush=True)
+    return run_dialog(spec, o, lambda v: print(round(v["value"])), timeout_output=True, on_event=on_event)
+
+
+def parse_rgba(text):
+    """zenity（gdk_rgba_parse）認得 rgb()／rgba()，QML 不認得：轉成 #rrggbbaa；其他字串原樣交給 QML。"""
+    m = re.fullmatch(r"\s*rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)\s*", text)
+    if not m:
+        return text
+    r, g, b = (max(0, min(255, round(float(x)))) for x in m.groups()[:3])
+    a = max(0.0, min(1.0, float(m.group(4)))) if m.group(4) else 1.0
+    return f"#{r:02x}{g:02x}{b:02x}{round(a * 255):02x}"
+
+
+def mode_color(o):
+    spec = base_spec(o, "color-selection")
+    field = {"type": "color", "id": "color", "alpha": True, "palette": o.has("show-palette")}
+    if o.has("color"):
+        field["color"] = parse_rgba(o.get("color"))
+    spec["fields"] = [field]
+    spec["buttons"] = ok_cancel(o) + extra_buttons(o)
+
+    def output(v):
+        c = v["color"]
+        # gdk_rgba_to_string 的格式
+        if c["a"] >= 0.999:
+            print(f"rgb({c['r']},{c['g']},{c['b']})")
+        else:
+            print(f"rgba({c['r']},{c['g']},{c['b']},{c['a']:g})")
+    return run_dialog(spec, o, output)
+
+
+def column_indexes(spec, ncol):
+    """「1,3」這種欄位編號（從 1 起算），超出範圍的忽略；回傳從 0 起算的位置。"""
+    out = []
+    for part in str(spec).split(","):
+        try:
+            n = int(part)
+        except ValueError:
+            continue
+        if 0 < n <= ncol:
+            out.append(n - 1)
+    return out
+
+
+def mode_list(o):
+    columns = o.all("column")
+    if not columns:
+        die("No column titles specified for List dialog.")
+    kinds = [k for k in ("checklist", "radiolist", "imagelist") if o.has(k)]
+    if len(kinds) > 1:
+        die("You should use only one List dialog type.")
+    toggles = o.has("checklist") or o.has("radiolist")
+    if toggles and len(columns) < 2:
+        die("Insufficient columns specified for List dialog (at least 2 are required for --checklist or --radiolist).")
+    ncol = len(columns)
+    hidden = set(column_indexes(o.get("hide-column"), ncol)) if o.has("hide-column") else set()
+    # check／radio 的第一欄是勾選狀態（TRUE／FALSE），不當成文字欄顯示。
+    shown_cols = [c for c in range(ncol) if c not in hidden and not (toggles and c == 0)]
+    if str(o.get("print-column", "")).lower() == "all":
+        print_cols = list(range(1 if toggles else 0, ncol))
+    elif o.has("print-column"):
+        print_cols = column_indexes(o.get("print-column"), ncol)
+    else:
+        print_cols = [1 if toggles else 0]
+    separator = strcompress(o.get("separator", "|"))
+
+    full_rows = []  # 原始的整列（輸出用；顯示用的列拿掉隱藏欄與勾選欄）
+
+    def add(cells_list):
+        rows, checked = [], []
+        for cells in cells_list:
+            cells = cells + [""] * (ncol - len(cells))
+            if toggles and cells[0].lower() == "true":
+                checked.append(len(rows))
+            full_rows.append(cells)
+            rows.append([cells[c] for c in shown_cols])
+        return rows, checked
+
+    def chunk(cells):
+        return [cells[k:k + ncol] for k in range(0, len(cells), ncol)]
+
+    spec = base_spec(o, "list")
+    spec["text"] = markup_text(o, "list")
+    spec["markup"] = True
+    mode = "check" if o.has("checklist") else "radio" if o.has("radiolist") else \
+        "multiple" if o.has("multiple") else "single"
+    field = {"type": "list", "id": "list", "columns": [columns[c] for c in shown_cols],
+             "types": ["image" if o.has("imagelist") and c == 0 else "text" for c in shown_cols],
+             "mode": mode, "hideHeader": o.has("hide-header"), "editable": o.has("editable")}
+
+    feeder = None
+    if o.args:
+        # 參數的資料只取完整的列（同 zenity）。
+        cells = o.args[:len(o.args) - len(o.args) % ncol]
+        field["rows"], field["checked"] = add(chunk(cells))
+    else:
+        # stdin：一行一格，依欄數分列；之後讀到的陸續加上去。
+        reader = StdinReader()
+        pending = reader.initial()
+        whole = pending[:len(pending) - len(pending) % ncol]
+        leftover = pending[len(whole):]
+        field["rows"], field["checked"] = add(chunk(whole))
+
+        def feeder(ui):
+            nonlocal leftover
+            for lines in reader.batches():
+                cells = leftover + lines
+                complete = cells[:len(cells) - len(cells) % ncol]
+                leftover = cells[len(complete):]
+                if complete:
+                    rows, checked = add(chunk(complete))
+                    ui.update({"fields": {"list": {"append": {"rows": rows, "checked": checked}}}})
+            if leftover:  # 最後不完整的一列也加上（同 zenity 讀 stdin 的行為）
+                rows, checked = add([leftover])
+                ui.update({"fields": {"list": {"append": {"rows": rows, "checked": checked}}}})
+        if reader.eof and not reader.lines and leftover:
+            # 資料在開窗前就讀完了：不完整的最後一列直接放進初始資料。
+            rows, checked = add([leftover])
+            field["checked"] += [len(field["rows"]) + i for i in checked]
+            field["rows"] += rows
+            leftover = []
+    spec["fields"] = [field]
+    spec["buttons"] = ok_cancel(o) + extra_buttons(o)
+    if not o.has("height"):
+        spec["height"] = 480
+
+    def output(v):
+        result = v.get("list", {})
+        edited = result.get("rows")
+        out = []
+        for i in result.get("selected", []):
+            row = list(full_rows[i])
+            if edited:
+                for k, c in enumerate(shown_cols):
+                    row[c] = str(edited[i][k])
+            out.extend(row[c] for c in print_cols if c < len(row))
+        if out:
+            print(separator.join(out))
+    return run_dialog(spec, o, output, timeout_output=True, feeder=feeder)
+
+
+def parse_font(desc):
+    """Pango 字型描述（「Monospace Bold 12」）→ {family, size, bold, italic}；大小是 pt，換成 px。"""
+    words = desc.split()
+    font = {}
+    if words and re.fullmatch(r"\d+(\.\d+)?(px)?", words[-1]):
+        size = words.pop()
+        font["size"] = round(float(size[:-2])) if size.endswith("px") else round(float(size) * 4 / 3)
+    styles = {"bold": "bold", "italic": "italic", "oblique": "italic"}
+    while words and words[-1].lower() in styles:
+        font[styles[words.pop().lower()]] = True
+    if words:
+        font["family"] = " ".join(words).rstrip(",")
+    return font
+
+
+def mode_text_info(o):
+    spec = base_spec(o, "text-info")
+    spec.setdefault("width", 600)
+    spec.setdefault("height", 500)
+    if o.has("url"):
+        print("rtfs-zenity: --url is not supported (no web engine); showing text only", file=sys.stderr)
+    field = {"type": "text", "id": "text", "editable": o.has("editable"), "html": o.has("html"),
+             "wrap": not o.has("no-wrap"), "autoScroll": o.has("auto-scroll")}
+    if o.has("font"):
+        field["font"] = parse_font(o.get("font"))
+    feeder = None
+    if o.has("filename"):
+        try:
+            with open(o.get("filename"), encoding="utf-8", errors="replace") as f:
+                field["text"] = f.read()
+        except OSError as e:
+            print(f"rtfs-zenity: {e}", file=sys.stderr)
+    else:
+        reader = StdinReader()
+        field["text"] = "".join(line + "\n" for line in reader.initial())
+
+        def feeder(ui):
+            for lines in reader.batches():
+                ui.update({"fields": {"text": {"append": "".join(line + "\n" for line in lines)}}})
+    fields = [field]
+    buttons = ok_cancel(o)
+    if o.has("checkbox"):
+        # 「我已閱讀並同意」：勾選前不能按確定。
+        fields.append({"type": "check", "id": "agree", "label": o.get("checkbox")})
+        buttons[1]["requires"] = "agree"
+    spec["fields"] = fields
+    spec["buttons"] = buttons + extra_buttons(o)
+
+    def output(v):
+        if o.has("editable"):
+            sys.stdout.write(v.get("text", ""))
+    return run_dialog(spec, o, output, timeout_output=True, feeder=feeder)
+
+
+def mode_progress(o):
+    auto_close, no_cancel = o.has("auto-close"), o.has("no-cancel")
+    percentage = max(0, min(100, o.get("percentage", 0)))
+    if auto_close and o.has("percentage") and percentage == 100:
+        die("Combining the options --auto-close and --percentage=100 is not supported.")
+    spec = base_spec(o, "progress")
+    spec["text"] = markup_text(o, "progress")
+    spec["markup"] = True
+    spec["fields"] = [{"type": "progress", "id": "p", "value": percentage, "pulsate": o.has("pulsate")}]
+
+    # 確定鈕在進度到 100% 或 stdin 結束前不能按；stdin 結束後取消鈕不能按。
+    state = {"cancel": True, "ok": percentage == 100}
+
+    def buttons():
+        b = []
+        if not no_cancel:
+            b.append({"id": "cancel", "label": o.get("cancel-label", CANCEL_LABEL), "disabled": not state["cancel"]})
+        if not auto_close:
+            b.append({"id": "ok", "label": o.get("ok-label", OK_LABEL), "role": "accept",
+                      "default": state["ok"], "disabled": not state["ok"]})
+        return b + extra_buttons(o)
+    spec["buttons"] = buttons()
+
+    started = [None]
+
+    def remaining(pct):
+        # 同 zenity：依目前百分比和經過時間估計剩餘時間。
+        if started[0] is None or pct <= 0 or pct >= 100:
+            started[0] = time.monotonic()
+            return ""
+        elapsed = time.monotonic() - started[0]
+        left = int(100 * elapsed / pct - elapsed)
+        return tr("剩餘時間：%1", f"{left // 3600}:{left // 60 % 60:02d}:{left % 60:02d}")
+
+    def feeder(ui):
+        for line in sys.stdin:
+            line = line.rstrip("\n")
+            if line.startswith("#"):
+                ui.update({"text": pango_to_styled(strcompress(line[1:].strip())), "markup": True})
+            elif line.startswith("pulsate"):
+                _, colon, value = line.partition(":")
+                if colon:
+                    ui.update({"fields": {"p": {"pulsate": value.strip().lower() != "false"}}})
+            elif line[:1].isdigit():
+                pct = max(0.0, min(100.0, float(re.match(r"\d+(\.\d*)?", line).group(0))))
+                patch = {"value": pct}
+                if o.has("time-remaining"):
+                    patch["text"] = remaining(pct)
+                ui.update({"fields": {"p": patch}})
+                if pct == 100:
+                    if auto_close:
+                        ui.close()
+                        return
+                    state["ok"] = True
+                    ui.update({"buttons": buttons()})
+        # stdin 結束：視為完成。
+        state["cancel"], state["ok"] = False, True
+        ui.update({"fields": {"p": {"value": 100, "pulsate": False}}, "buttons": buttons()})
+        if auto_close:
+            ui.close()
+
+    code = run_dialog(spec, o, feeder=feeder)
+    if code == exit_code("CANCEL") and o.has("auto-kill"):
+        os.kill(os.getppid(), signal.SIGHUP)
+    return code
+
+
+def mode_forms(o):
+    spec = base_spec(o, "forms")
+    spec["text"] = markup_text(o, "forms")
+    spec["markup"] = True
+    separator = strcompress(o.get("separator", "|"))
+    fmt = date_format(o, "forms-date-format")
+    list_values, column_values, combo_values = o.all("list-values"), o.all("column-values"), o.all("combo-values")
+    fields, kinds = [], []
+    n_list = n_combo = 0
+    for n, (kind, label) in enumerate(o.order):
+        fid = f"f{n}"
+        if kind == "add-entry":
+            fields.append({"type": "entry", "id": fid, "label": label})
+        elif kind == "add-password":
+            fields.append({"type": "entry", "id": fid, "label": label, "password": True})
+        elif kind == "add-multiline-entry":
+            fields.append({"type": "text", "id": fid, "label": label, "editable": True})
+        elif kind == "add-calendar":
+            fields.append({"type": "calendar", "id": fid, "label": label})
+        elif kind == "add-list":
+            cols_spec = column_values[n_list] if n_list < len(column_values) else \
+                column_values[0] if column_values else "column"
+            cols = cols_spec.split("|")
+            values = list_values[n_list].split("|") if n_list < len(list_values) else []
+            rows = [values[k:k + len(cols)] for k in range(0, len(values), len(cols))]
+            fields.append({"type": "list", "id": fid, "label": label, "columns": cols, "rows": rows,
+                           "mode": "single", "search": False, "hideHeader": not o.has("show-header"),
+                           "visibleRows": 5})
+            n_list += 1
+        elif kind == "add-combo":
+            values = combo_values[n_combo].split("|") if n_combo < len(combo_values) else []
+            fields.append({"type": "entry", "id": fid, "label": label, "choices": values,
+                           "editable": False, "text": values[0] if values else ""})
+            n_combo += 1
+        kinds.append(kind)
+    spec["fields"] = fields
+    spec["buttons"] = ok_cancel(o) + extra_buttons(o)
+
+    def output(v):
+        out = []
+        for f, kind in zip(fields, kinds):
+            value = v.get(f["id"])
+            if kind == "add-list":
+                out.append(",".join(",".join(f["rows"][i]) for i in (value or {}).get("selected", [])))
+            elif kind == "add-calendar":
+                out.append(format_date(value, fmt))
+            elif kind == "add-combo":
+                out.append(value or " ")
+            else:
+                out.append(value or "")
+        print(separator.join(out))
+    return run_dialog(spec, o, output, timeout_output=True)
+
+
+def mode_file(o):
+    spec = {"container": "file", "title": o.get("title") or HEADINGS["file-selection"]}
+    for flag in ("save", "directory", "multiple"):
+        if o.has(flag):
+            spec[flag] = True
+    if o.has("filename"):
+        spec["filename"] = o.get("filename")
+    filters = []
+    for f in o.all("file-filter"):
+        # 「名稱 | 樣式 樣式」或只有「樣式 樣式」（名稱就是整串）。
+        name, bar, patterns = f.partition("|")
+        if not bar:
+            name, patterns = f, f
+        filters.append({"name": name.strip(), "patterns": patterns.split()})
+    if filters:
+        spec["filters"] = filters
+    if o.get("timeout", 0) > 0:
+        spec["timeout"] = o.get("timeout")
+    return run_dialog(spec, o, lambda v: print(o.get("separator", "|").join(v["paths"])))
+
+
+def notify(summary, body, icon):
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    bus.call_sync("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                  "org.freedesktop.Notifications", "Notify",
+                  GLib.Variant("(susssasa{sv}i)", ("Zenity", 0, icon or "", summary, body or "", [], {}, -1)),
+                  None, Gio.DBusCallFlags.NONE, -1, None)
+
+
+def notify_message(message, icon):
+    # 「標題\n內文」：第一個換行之前是標題。
+    title, _, body = strcompress(message).partition("\n")
+    notify(title, body, icon)
+
+
+def mode_notification(o):
+    icon = o.get("icon") or o.get("icon-name") or o.get("window-icon")
+    if not o.has("listen"):
+        if not o.has("text"):
+            return 1
+        notify_message(o.get("text"), icon)
+        if o.get("timeout", 0) > 0:
+            time.sleep(o.get("timeout"))
+            return exit_code("TIMEOUT")
+        return exit_code("OK")
+    # --listen：stdin 每行一個「指令: 值」。
+    for line in sys.stdin:
+        command, colon, value = line.rstrip("\n").partition(":")
+        if not colon:
+            print("Could not parse command from stdin", file=sys.stderr)
+            continue
+        command, value = command.strip().lower(), value.lstrip()
+        if command == "icon":
+            icon = value
+        elif command in ("message", "tooltip"):
+            notify_message(value, icon)
+        elif command != "visible":
+            print(f"Unknown command '{command}'", file=sys.stderr)
+    return exit_code("OK")
+
+
+def mode_about(o):
+    spec = base_spec(o, "info")
+    spec["title"] = o.get("title") or tr("關於 rtfs-zenity")
+    spec["text"] = tr("rtfs-zenity：相容 zenity %1 的對話框工具，畫面由 QuickShell（rtfs-ui）提供。\n"
+                      "檔案選擇使用 xdg-desktop-portal，通知送到桌面通知。", VERSION)
+    spec["icon"] = "info"
+    spec["buttons"] = [{"id": "ok", "label": OK_LABEL, "role": "accept", "default": True}]
+    return run_dialog(spec, o)
+
+
+def main():
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, forward_signal)
+    # SIGINT 會送給整個 process group，rtfs-ui 自己會收掉對話框；這裡只等它結束。
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    o = parse(sys.argv[1:])
+    if o.has("version"):
+        print(VERSION)
+        return 0
+    if o.has("about"):
+        return mode_about(o)
+    if o.mode is None:
+        die("You must specify a dialog type. See 'rtfs-zenity --help' for details")
+    handlers = {
+        "info": lambda: mode_message(o, "info"),
+        "warning": lambda: mode_message(o, "warning"),
+        "error": lambda: mode_message(o, "error"),
+        "question": lambda: mode_message(o, "question"),
+        "entry": lambda: mode_entry(o),
+        "password": lambda: mode_password(o),
+        "calendar": lambda: mode_calendar(o),
+        "scale": lambda: mode_scale(o),
+        "color-selection": lambda: mode_color(o),
+        "list": lambda: mode_list(o),
+        "text-info": lambda: mode_text_info(o),
+        "progress": lambda: mode_progress(o),
+        "forms": lambda: mode_forms(o),
+        "file-selection": lambda: mode_file(o),
+        "notification": lambda: mode_notification(o),
+    }
+    return handlers[o.mode]()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

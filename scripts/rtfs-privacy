@@ -1,0 +1,168 @@
+#!/usr/bin/python3
+"""Report microphone privacy switch and camera usage to the shell.
+
+Prints one JSON line at start and whenever something changes:
+
+    {"micSwitch": true | false | null, "camera": true | false}
+
+micSwitch: state of the Framework laptop's hardware microphone switch
+(true = microphone connected), read from the EC with the Framework-specific
+host command 0x3E14. null when there is no such switch (no /dev/cros_ec, no
+permission, or an EC that does not know the command). The EC does not notify
+changes, so it is polled every second, except while paused.
+
+camera: whether any process has a /dev/video* node open. Watched with
+inotify (open/close on each node, create/delete in /dev for hotplug) and
+confirmed by scanning /proc only on those events, because a full scan costs
+~20 ms. Only processes of the same user are visible, which covers desktop
+apps and the user's PipeWire.
+
+The camera hardware switch is not reported: on the FW12 the EC does not
+know it, and the webcam only sends its UVC Privacy event while streaming.
+
+stdin: "pause" stops EC polling (the shell sends it while the screens are
+off, so an idle laptop is not woken every second), "resume" restarts it
+with an immediate read. Camera watching is event-driven and keeps running.
+"""
+
+import ctypes
+import fcntl
+import json
+import os
+import select
+import struct
+import sys
+
+EC_DEV = "/dev/cros_ec"
+EC_CMD_PRIVACY_SWITCHES_CHECK_MODE = 0x3E14
+# _IOWR(0xEC, 0, struct cros_ec_command_v2) with its 20-byte header
+CROS_EC_DEV_IOCXCMD_V2 = 0xC014EC00
+
+IN_OPEN = 0x20
+IN_CLOSE_WRITE = 0x08
+IN_CLOSE_NOWRITE = 0x10
+IN_CREATE = 0x100
+IN_DELETE = 0x200
+IN_NONBLOCK = os.O_NONBLOCK
+IN_CLOEXEC = os.O_CLOEXEC
+
+
+def open_ec():
+    try:
+        return os.open(EC_DEV, os.O_RDWR | os.O_CLOEXEC)
+    except OSError:
+        return None
+
+
+def read_mic_switch(ec):
+    if ec is None:
+        return None
+    buf = bytearray(struct.pack("<IIIII", 0, EC_CMD_PRIVACY_SWITCHES_CHECK_MODE, 0, 2, 0) + b"\0\0")
+    try:
+        fcntl.ioctl(ec, CROS_EC_DEV_IOCXCMD_V2, buf, True)
+    except OSError:
+        return None
+    if struct.unpack_from("<I", buf, 16)[0] != 0:  # EC result: unsupported etc.
+        return None
+    return buf[20] != 0
+
+
+def video_nodes():
+    return sorted("/dev/" + n for n in os.listdir("/dev") if n.startswith("video"))
+
+
+def camera_in_use():
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            for fd in os.scandir(f"/proc/{pid}/fd"):
+                try:
+                    if os.readlink(fd.path).startswith("/dev/video"):
+                        return True
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return False
+
+
+class Inotify:
+    def __init__(self):
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.fd = self.libc.inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1")
+        self.add("/dev", IN_CREATE | IN_DELETE)
+        self.watched = set()
+        self.sync_nodes()
+
+    def add(self, path, mask):
+        return self.libc.inotify_add_watch(self.fd, path.encode(), mask) >= 0
+
+    def sync_nodes(self):
+        # Watches on deleted nodes go away by themselves; only add new ones.
+        nodes = set(video_nodes())
+        for n in nodes - self.watched:
+            self.add(n, IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE)
+        self.watched = nodes
+
+    def drain(self):
+        """Read pending events; return (camera_event, nodes_changed)."""
+        camera = changed = False
+        while True:
+            try:
+                data = os.read(self.fd, 65536)
+            except BlockingIOError:
+                return camera, changed
+            off = 0
+            while off < len(data):
+                _wd, mask, _cookie, length = struct.unpack_from("iIII", data, off)
+                name = data[off + 16 : off + 16 + length].split(b"\0")[0]
+                off += 16 + length
+                if mask & (IN_CREATE | IN_DELETE):
+                    if name.startswith(b"video"):
+                        changed = camera = True
+                else:
+                    camera = True
+
+
+def main():
+    ec = open_ec()
+    ino = Inotify()
+    last = None
+    camera = camera_in_use()
+    paused = False
+    mic = read_mic_switch(ec)
+    stdin = sys.stdin.fileno()
+    while True:
+        state = {"micSwitch": mic, "camera": camera}
+        if state != last:
+            print(json.dumps(state), flush=True)
+            last = state
+        ready, _, _ = select.select([ino.fd, stdin], [], [], None if paused else 1.0)
+        if stdin in ready:
+            # os.read, not sys.stdin: buffered lines would be invisible to select.
+            data = os.read(stdin, 4096)
+            if not data:  # shell gone
+                return
+            for cmd in data.decode(errors="replace").split():
+                if cmd == "pause":
+                    paused = True
+                elif cmd == "resume":
+                    paused = False
+        if not paused:
+            mic = read_mic_switch(ec)
+        if ino.fd in ready:
+            cam_event, changed = ino.drain()
+            if changed:
+                ino.sync_nodes()
+            if cam_event:
+                camera = camera_in_use()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        sys.exit(0)

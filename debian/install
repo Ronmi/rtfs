@@ -1,0 +1,16 @@
+shell/*.qml usr/share/rtfs/shell
+shell/*.js usr/share/rtfs/shell
+shell/i18n usr/share/rtfs/shell
+scripts/rtfs-pinentry usr/share/rtfs/scripts
+scripts/rtfs-portal usr/share/rtfs/scripts
+scripts/rtfs-privacy usr/share/rtfs/scripts
+scripts/rtfs-sleep-lock usr/share/rtfs/scripts
+scripts/rtfs-type usr/share/rtfs/scripts
+scripts/rtfs-ui usr/share/rtfs/scripts
+scripts/rtfs-vkbd usr/share/rtfs/scripts
+scripts/rtfs-zenity usr/share/rtfs/scripts
+scripts/rtfs_i18n.py usr/share/rtfs/scripts
+theme/gtk3.css usr/share/rtfs/theme
+theme/gtk4.css usr/share/rtfs/theme
+theme/niri-colors.kdl usr/share/rtfs/theme
+theme/qt6ct usr/share/rtfs/theme

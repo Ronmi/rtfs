@@ -1,0 +1,74 @@
+#!/usr/bin/python3 -I
+"""睡前鎖定的 logind 中介（由 shell 的 LockScreen 啟動，不是給人直接執行的）。
+
+QuickShell 不能直接用 D-Bus，所以由這裡向 logind 拿一個 delay 型的 sleep inhibitor：
+系統要睡眠／休眠時 logind 會先發 PrepareForSleep(true)，並最多等 InhibitDelayMaxSec（預設 5 秒）讓持有者放手。
+
+協定（一行一個）：
+  stdout  {"event": "sleep"}   要睡了：shell 鎖定，畫面確實蓋好之後回 ready
+          {"event": "resume"}  醒來了（只是通知）
+  stdin   ready               放掉 inhibitor，系統繼續睡；醒來後再拿一個新的
+shell 沒回應時 logind 時間到也會照睡，所以這裡不另外計時。stdin 關閉（shell 結束）就跟著結束。
+"""
+import json
+import os
+import sys
+
+# 介面文字翻譯（shell/i18n）。腳本目錄不一定在 sys.path（python3 -I、從 /usr/bin 的 symlink 執行），自己加。
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from rtfs_i18n import tr  # noqa: E402
+
+from gi.repository import Gio, GLib
+
+LOGIN1 = ("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager")
+
+bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+inhibitor = -1
+
+
+def emit(event):
+    print(json.dumps({"event": event}), flush=True)
+
+
+def take():
+    global inhibitor
+    if inhibitor >= 0:
+        return
+    _, fds = bus.call_with_unix_fd_list_sync(
+        *LOGIN1, "Inhibit",
+        GLib.Variant("(ssss)", ("sleep", "rtfs", tr("睡眠前先鎖定螢幕"), "delay")),
+        GLib.VariantType("(h)"), Gio.DBusCallFlags.NONE, -1, None, None)
+    inhibitor = fds.steal_fds()[0]
+
+
+def release():
+    global inhibitor
+    if inhibitor >= 0:
+        os.close(inhibitor)
+        inhibitor = -1
+
+
+def on_prepare(_conn, _sender, _path, _iface, _signal, params):
+    if params.unpack()[0]:
+        emit("sleep")
+    else:
+        take()
+        emit("resume")
+
+
+def on_stdin(source, _cond):
+    line = source.readline()
+    if not line:
+        loop.quit()
+        return False
+    if line.strip() == "ready":
+        release()
+    return True
+
+
+bus.signal_subscribe(LOGIN1[0], LOGIN1[2], "PrepareForSleep", LOGIN1[1], None,
+                     Gio.DBusSignalFlags.NONE, on_prepare)
+take()
+loop = GLib.MainLoop()
+GLib.io_add_watch(sys.stdin, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, on_stdin)
+loop.run()

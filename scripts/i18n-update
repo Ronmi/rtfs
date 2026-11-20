@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Create or update a translation table: shell/i18n/<lang>.json.
+
+Collects every translatable source string:
+  - QML/JS:  I18n.tr("...")           (shell/*.qml, shell/*.js)
+  - Python:  tr("...")                (scripts/rtfs-* using rtfs_i18n)
+  - labels, descriptions and choice labels in shell/ConfigSchema.js
+Only literal first arguments count, so never build the source string at runtime.
+
+Existing translations are kept, new strings are added with an empty value, strings no longer
+used are removed (and listed). Keys are grouped by the file they first appear in.
+
+Usage: scripts/i18n-update <lang> [--check]
+  --check  do not write; print untranslated / obsolete strings, exit 1 if any.
+"""
+
+import argparse
+import ast
+import glob
+import json
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+# One string literal: triple-quoted (Python), or single-line double/single-quoted.
+ONE = r'(?:"""(?:[^\\]|\\.)*?"""|\'\'\'(?:[^\\]|\\.)*?\'\'\'|"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\')'
+# Python joins adjacent literals ("a" "b" on separate lines); JS sources only ever have one.
+LITERAL = r'(' + ONE + r'(?:\s*' + ONE + r')*)'
+QML_CALL = re.compile(r'\bI18n\.tr\(\s*' + LITERAL)
+PY_CALL = re.compile(r'(?<![\w.])tr\(\s*' + LITERAL)
+
+
+def unescape(literal):
+    # The JS literals used here only need escapes that Python spells the same way.
+    return ast.literal_eval("(" + literal + ")")
+
+
+def collect():
+    keys = []
+    seen = set()
+
+    def add(s):
+        if s and s not in seen:
+            seen.add(s)
+            keys.append(s)
+
+    for path in sorted(glob.glob(os.path.join(ROOT, "shell", "*.qml")) + glob.glob(os.path.join(ROOT, "shell", "*.js"))):
+        with open(path, encoding="utf-8") as f:
+            for m in QML_CALL.finditer(f.read()):
+                add(unescape(m.group(1)))
+
+    with open(os.path.join(ROOT, "shell", "ConfigSchema.js"), encoding="utf-8") as f:
+        text = f.read()
+    schema = json.loads(text[text.index("var schema =") + len("var schema ="):].strip().rstrip(";"))
+
+    def walk(node):
+        for key in ("label", "desc"):
+            add(node.get(key))
+        for c in node.get("choices", []):
+            add(c.get("label"))
+        for child in node.get("items", {}).values():
+            walk(child)
+
+    for group in schema.values():
+        walk(group)
+
+    for path in sorted(glob.glob(os.path.join(ROOT, "scripts", "rtfs-*"))):
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        if "rtfs_i18n" not in text:
+            continue
+        for m in PY_CALL.finditer(text):
+            add(unescape(m.group(1)))
+    return keys
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Create or update shell/i18n/<lang>.json")
+    ap.add_argument("lang", help="language code, e.g. en, ja, ko, zh_CN")
+    ap.add_argument("--check", action="store_true", help="report only, do not write")
+    args = ap.parse_args()
+
+    out_path = os.path.join(ROOT, "shell", "i18n", args.lang + ".json")
+    old = {}
+    if os.path.exists(out_path):
+        with open(out_path, encoding="utf-8") as f:
+            old = json.load(f)
+
+    keys = collect()
+    table = {k: old.get(k, "") for k in keys}
+    obsolete = [k for k in old if k not in table]
+    missing = [k for k, v in table.items() if not v]
+
+    if args.check:
+        for k in missing:
+            print("untranslated:", k)
+        for k in obsolete:
+            print("obsolete:", k)
+        print(f"{len(keys)} strings, {len(missing)} untranslated, {len(obsolete)} obsolete", file=sys.stderr)
+        sys.exit(1 if missing or obsolete else 0)
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(table, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    for k in obsolete:
+        print("removed:", k)
+    print(f"{out_path}: {len(keys)} strings, {len(missing)} untranslated, {len(obsolete)} removed", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

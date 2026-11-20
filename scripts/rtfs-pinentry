@@ -1,0 +1,308 @@
+#!/usr/bin/python3
+"""rtfs-pinentry：pinentry 相容程式（gpg-agent 的 pinentry-program）。說 Assuan 協定，畫面交給 rtfs-ui。
+
+gpg-agent 從 stdin 送指令、從 stdout 讀回應；行為對照 pinentry 1.3.1（回應格式、錯誤代碼都照它）。
+  SETDESC／SETPROMPT／SETTITLE／SETERROR／SETOK／SETCANCEL／SETNOTOK／SETREPEAT／SETREPEATERROR／SETTIMEOUT
+  GETPIN（輸入密碼）、CONFIRM [--one-button]（確認）、MESSAGE（訊息）、GETINFO、OPTION、RESET、BYE
+一律用 modal（整個桌面變暗、獨佔鍵盤）。
+
+刻意的差異：
+- 品質條（SETQUALITYBAR）、產生密碼（SETGENPIN）、外部密碼快取（SETKEYINFO）不支援，指令照收不處理。
+- OPTION 全部回 OK（pinentry 對不認得的回錯誤，gpg-agent 也不理會）；只用到 default-ok／default-cancel／
+  default-prompt。
+- SETREPEAT：同一個畫面放兩個輸入框，按確定時兩者不同就重新顯示，並附上 SETREPEATERROR 的訊息。
+- 密碼在 Python 與 QuickShell 的記憶體裡都沒有 mlock（swap 有加密，見 memories/open-work.md）。
+
+gpg-agent 是 GNOME 與 niri 兩個 session 共用的，所以啟動時先判斷：呼叫端的 WAYLAND_DISPLAY（gpg-agent 從
+gpg 那邊轉過來）上有我們的 QuickShell 在跑才自己處理，否則 exec 別的 pinentry。rtfs 套件把自己註冊成
+pinentry alternative，所以不能直接用 /usr/bin/pinentry（會 exec 回自己）：改從 alternative 群組挑，
+手動選了別的就用那個，否則用優先權最高的非 rtfs 項目（通常是 pinentry-gnome3，沒有圖形環境時它自己會改用
+curses）。所以 GNOME、SSH、tty 都跟原本一樣，
+兩個 session 同時登入時也不會把對話框開到另一邊。
+rtfs-ui 中途失敗（qs 重新載入設定等）時回 General error。
+"""
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+
+# 介面文字翻譯（shell/i18n）。腳本目錄不一定在 sys.path（python3 -I、從 /usr/bin 的 symlink 執行），自己加。
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from rtfs_i18n import tr  # noqa: E402
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+RTFS_UI = os.path.join(HERE, "rtfs-ui")
+
+# gpg-error 代碼：錯誤來源 Pinentry（5）<< 24 | 錯誤碼。訊息文字照 pinentry 原樣。
+ERR_GENERAL = "ERR 83886081 General error <Pinentry>"
+ERR_TIMEOUT = "ERR 83886142 Timeout <Pinentry>"
+ERR_CANCELED = "ERR 83886179 Operation cancelled <Pinentry>"
+ERR_NOT_CONFIRMED = "ERR 83886194 Not confirmed <Pinentry>"
+ERR_PARAMETER = "ERR 83886360 IPC parameter error <Pinentry>"
+ERR_UNKNOWN_CMD = "ERR 536871187 Unknown IPC command <User defined source 1>"
+
+# Assuan 一行最多 1000 bytes（含 "D " 與換行）。
+MAX_DATA = 1000 - 3
+
+child = None  # 執行中的 rtfs-ui
+
+
+def send(line):
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+def unescape(s):
+    """指令參數的 %XX 解碼（gpg-agent 用 %0A 表示換行）。"""
+    raw = re.sub(rb"%([0-9A-Fa-f]{2})", lambda m: bytes([int(m[1], 16)]), s.encode())
+    return raw.decode("utf-8", "replace")
+
+
+def send_data(text):
+    """用 D 行送出資料：%、CR、LF 要 escape，太長要切行（不能切在 escape 中間）。"""
+    data = text.encode().replace(b"%", b"%25").replace(b"\r", b"%0D").replace(b"\n", b"%0A")
+    while data:
+        n = min(MAX_DATA, len(data))
+        if b"%" in data[max(0, n - 2):n] and n < len(data):
+            n = data.rfind(b"%", 0, n)
+        sys.stdout.buffer.write(b"D " + data[:n] + b"\n")
+        data = data[n:]
+    sys.stdout.flush()
+
+
+def label(s):
+    """pinentry 的按鈕文字用底線標快速鍵（_OK）；我們沒有快速鍵，拿掉單一底線，__ 還原成 _。"""
+    return re.sub(r"_(_?)", r"\1", s)
+
+
+class State:
+    def __init__(self):
+        self.reset()
+        # OPTION 設定的值跨 RESET 保留（pinentry 也是）。
+        self.default_ok = None
+        self.default_cancel = None
+        self.default_prompt = None
+
+    def reset(self):
+        self.desc = ""
+        self.prompt = None
+        self.title = None
+        self.ok = None
+        self.cancel = None
+        self.notok = None
+        self.error = None
+        self.repeat = None
+        self.repeat_error = None
+        self.timeout = 0
+
+
+def run_ui(spec):
+    """顯示畫面，回傳 rtfs-ui 的結果 dict；失敗回傳 None。spec 從 stdin 送，不放在參數裡。"""
+    global child
+    child = subprocess.Popen([RTFS_UI], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        out, _ = child.communicate(json.dumps(spec, ensure_ascii=False))
+    finally:
+        rc, child = child.returncode, None
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+
+def base_spec(st, default_title):
+    spec = {"container": "modal", "title": st.title or default_title, "text": st.desc, "fields": []}
+    if st.timeout > 0:
+        spec["timeout"] = st.timeout
+    if st.error:
+        spec["fields"].append({"type": "label", "id": "error", "text": st.error, "tone": "error"})
+    return spec
+
+
+def ok_button(st):
+    return {"id": "ok", "label": label(st.ok or st.default_ok or tr("確定")), "role": "accept", "default": True}
+
+
+def cancel_button(st):
+    return {"id": "cancel", "label": label(st.cancel or st.default_cancel or tr("取消"))}
+
+
+def getpin(st):
+    prompt = st.prompt or st.default_prompt or tr("密碼：")
+    while True:
+        spec = base_spec(st, tr("輸入密碼"))
+        spec["fields"].append({"type": "entry", "id": "pin", "label": prompt, "password": True})
+        if st.repeat is not None:
+            spec["fields"].append({"type": "entry", "id": "repeat", "label": st.repeat or tr("再輸入一次："),
+                                   "password": True})
+        spec["buttons"] = [cancel_button(st), ok_button(st)]
+        result = run_ui(spec)
+        if result is None:
+            return send(ERR_GENERAL)
+        if result.get("reason") == "timeout":
+            return send(ERR_TIMEOUT)
+        if result.get("button") != "ok":
+            return send(ERR_CANCELED)
+        values = result.get("values", {})
+        pin = values.get("pin", "")
+        if st.repeat is not None and pin != values.get("repeat", ""):
+            st.error = st.repeat_error or tr("兩次輸入的密碼不一樣")
+            continue
+        if st.repeat is not None:
+            send("S PIN_REPEATED")
+        if pin:
+            send_data(pin)
+        del pin, values, result
+        return send("OK")
+
+
+def confirm(st, one_button):
+    spec = base_spec(st, tr("確認"))
+    if one_button:
+        spec["buttons"] = [ok_button(st)]
+    else:
+        spec["buttons"] = [cancel_button(st)]
+        if st.notok:
+            spec["buttons"].append({"id": "notok", "label": label(st.notok)})
+        spec["buttons"].append(ok_button(st))
+    result = run_ui(spec)
+    if result is None:
+        return send(ERR_GENERAL)
+    if result.get("reason") == "timeout":
+        return send(ERR_TIMEOUT)
+    button = result.get("button")
+    if button == "ok":
+        return send("OK")
+    if one_button:  # MESSAGE 關掉視窗也算看過了
+        return send("OK")
+    return send(ERR_NOT_CONFIRMED if button == "notok" else ERR_CANCELED)
+
+
+def getinfo(arg):
+    info = {
+        "flavor": "rtfs",
+        "version": "1.3.1",
+        "pid": str(os.getpid()),
+        "ttyinfo": f"- - - - {os.getuid()}/{os.geteuid()} -",
+    }.get(arg)
+    if info is None:
+        return send(ERR_PARAMETER)
+    send_data(info)
+    send("OK")
+
+
+def main():
+    st = State()
+    send(f"OK Pleased to meet you, process {os.getpid()}")
+    setters = {
+        "SETDESC": "desc", "SETPROMPT": "prompt", "SETTITLE": "title", "SETOK": "ok",
+        "SETCANCEL": "cancel", "SETNOTOK": "notok", "SETERROR": "error", "SETREPEATERROR": "repeat_error",
+    }
+    for line in sys.stdin:
+        cmd, _, arg = line.rstrip("\r\n").partition(" ")
+        cmd = cmd.upper()
+        arg = unescape(arg)
+        if not cmd or cmd.startswith("#"):
+            continue
+        if cmd in setters:
+            setattr(st, setters[cmd], arg)
+            send("OK")
+        elif cmd == "SETREPEAT":
+            st.repeat = arg
+            send("OK")
+        elif cmd == "SETTIMEOUT":
+            try:
+                st.timeout = max(0, int(arg))
+            except ValueError:
+                st.timeout = 0
+            send("OK")
+        elif cmd == "OPTION":
+            name, _, value = arg.partition("=")
+            name = name.strip()
+            if name == "default-ok":
+                st.default_ok = value
+            elif name == "default-cancel":
+                st.default_cancel = value
+            elif name == "default-prompt":
+                st.default_prompt = value
+            send("OK")
+        elif cmd == "GETPIN":
+            getpin(st)
+            # 跟 pinentry 一樣，錯誤訊息與重複輸入只用一次。
+            st.error = st.repeat = None
+        elif cmd in ("CONFIRM", "MESSAGE"):
+            confirm(st, cmd == "MESSAGE" or "--one-button" in arg.split())
+            st.error = None
+        elif cmd == "GETINFO":
+            getinfo(arg.strip())
+        elif cmd == "RESET":
+            st.reset()
+            send("OK")
+        elif cmd == "BYE":
+            send("OK closing connection")
+            return 0
+        elif cmd in ("SETQUALITYBAR", "SETQUALITYBAR_TT", "SETGENPIN", "SETGENPIN_TT", "SETKEYINFO",
+                     "SETREPEATOK", "CLEARPASSPHRASE", "NOP", "CANCEL", "END", "HELP"):
+            send("OK")
+        else:
+            send(ERR_UNKNOWN_CMD)
+    return 0
+
+
+def qs_on_our_display():
+    """呼叫端的 Wayland display 上有沒有 QuickShell 在跑（qs list 的 JSON 沒有 display，只能讀文字版）。"""
+    display = os.environ.get("WAYLAND_DISPLAY")
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not display or not runtime:
+        return False
+    try:
+        r = subprocess.run(["qs", "list"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    want = os.path.join(runtime, display)
+    for m in re.finditer(r"^\s*Display connection: wayland/(\S+)", r.stdout, re.M):
+        if os.path.join(runtime, m[1]) == want:
+            return True
+    return False
+
+
+def fallback_pinentry():
+    """pinentry alternative 群組裡要改用的程式；排除 rtfs-pinentry 自己（套件版或開發用的 symlink）。"""
+    try:
+        r = subprocess.run(["update-alternatives", "--query", "pinentry"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    def ours(path):
+        return os.path.basename(os.path.realpath(path)) == "rtfs-pinentry"
+
+    value = re.search(r"^Value: (\S+)", r.stdout, re.M)
+    if value and not ours(value[1]):
+        return value[1]
+    alts = re.findall(r"^Alternative: (\S+)\nPriority: (-?\d+)", r.stdout, re.M)
+    alts = [(int(prio), path) for path, prio in alts if not ours(path)]
+    return max(alts)[1] if alts else None
+
+
+def forward_signal(signum, _frame):
+    # gpg-agent 放棄時（例如 Ctrl-C 了 gpg）會殺掉 pinentry；讓 rtfs-ui 收掉畫面上的對話框。
+    if child is not None:
+        child.send_signal(signum)
+    sys.exit(128 + signum)
+
+
+if __name__ == "__main__":
+    if not qs_on_our_display():
+        fallback = fallback_pinentry()
+        if fallback is None:
+            sys.exit(tr("rtfs-pinentry: 這個 display 上沒有 rtfs，pinentry alternative 也沒有其他程式可用"))
+        os.execv(fallback, [fallback, *sys.argv[1:]])
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, forward_signal)
+    sys.exit(main())

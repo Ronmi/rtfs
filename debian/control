@@ -1,0 +1,46 @@
+Source: rtfs
+Section: x11
+Priority: optional
+Maintainer: Ronmi Ren <ronmi.ren@gmail.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: rtfs
+Provides: notification-daemon, polkit-1-auth-agent
+Architecture: all
+Depends: ${misc:Depends},
+         quickshell (>= 0.3.2),
+         qml6-module-qtquick,
+         qml6-module-qtquick-controls,
+         qml6-module-qtquick-layouts,
+         python3,
+         python3-yaml,
+         python3-gi,
+         gir1.2-glib-2.0,
+         libglib2.0-bin,
+         fonts-font-awesome,
+         fonts-material-design-icons-iconfont,
+Recommends: niri,
+            xdg-desktop-portal,
+            qml6-module-qtquick-effects,
+            pinentry-gnome3 | pinentry,
+            wvkbd,
+            swaylock,
+            brightnessctl,
+            wl-mirror,
+            rfkill,
+            nm-connection-editor,
+            blueman,
+            iio-sensor-proxy,
+Description: Ronmi's Twice Flavored Shell, a QuickShell desktop shell for niri
+ rtfs (Ronmi's Twice Flavored Shell) is a personal desktop shell built
+ with QuickShell: bar, notifications, launcher, OSD, wallpaper, lock
+ screen, polkit agent and a generic dialog toolkit (rtfs-ui, with
+ zenity and pinentry adapters), styled with the
+ TWICE color scheme.
+ .
+ The shell is installed as QuickShell's system-wide default config
+ (/etc/xdg/quickshell), so a plain "qs" runs it unless
+ ~/.config/quickshell overrides it. Setup outside the package (niri
+ config, gpg-agent) is described in /usr/share/doc/rtfs/README.Debian.

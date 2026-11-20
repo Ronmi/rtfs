@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+# 優先權高於 pinentry-gnome3（90）：裝了就是預設。沒有 rtfs 的 session 由 rtfs-pinentry 自己退回別的 pinentry。
+if [ "$1" = configure ]; then
+    update-alternatives --install /usr/bin/pinentry pinentry /usr/bin/rtfs-pinentry 95
+fi
+
+#DEBHELPER#

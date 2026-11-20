@@ -1,0 +1,9 @@
+- [open-work](open-work.md) — START HERE: snapshot of unfinished work (dialog leftovers, palette, fuzzel cleanup), limitations
+- [lock-screen](lock-screen.md) — lock screen as built 2026-11-07: WlSessionLock/PAM facts, crash relock, unlock-signal bug, safe testing
+- [dev-workflow](dev-workflow.md) — How to run, inspect and visually check the QuickShell shell during development (niri spawn, qs log, niri…
+- [qml-gotchas](qml-gotchas.md) — QML/QuickShell pitfalls hit in this project (on* property names, color needs QtQuick, broken singleton breaks…
+- [dialog-tool](dialog-tool.md) — rtfs-ui UI toolkit over QuickShell IPC target ui (window/modal containers, Field*.qml), rtfs-zenity adapter, protocol, what is left
+- [quick-terminal-overview](quick-terminal-overview.md) — kitty quick-access-terminal hidden while niri overview is open, restored after
+- [power-profiles-boot-delay](power-profiles-boot-delay.md) — never use PowerProfiles directly; PowerProfileState avoids 20s boot block
+- [forgejo-ci](forgejo-ci.md) — Forgejo Actions: stock actions, only the Debian registry upload hand-written (private, not in public snapshots)
+- [osk](osk.md) — own OSK (Osk.qml + rtfs-vkbd): only key events, never `modifiers`; verification/cutover status

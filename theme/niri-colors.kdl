@@ -1,0 +1,13 @@
+// 由 rtfs 的 scripts/theme-gen 從 theme/palette.sh 產生，請勿手動編輯。
+layout {
+    focus-ring {
+        active-gradient from="#F9C596" to="#FC5D9D" angle=45
+        inactive-color "#9E9AA4"
+        urgent-color "#E62722"
+    }
+    border {
+        active-gradient from="#F9C596" to="#FC5D9D" angle=45
+        inactive-color "#9E9AA4"
+        urgent-color "#E62722"
+    }
+}

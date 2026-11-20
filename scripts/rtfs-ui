@@ -1,0 +1,643 @@
+#!/usr/bin/python3
+"""rtfs-ui：透過 QuickShell（shell/Dialogs.qml，IPC target "ui"）顯示 UI 元件的通用前端。
+
+用法：
+  rtfs-ui 子命令 [選項...]
+      命令列模式，給 script 用：info、warning、error、question、entry、password、list、text、scale、
+      number、calendar、color、font、progress、file、osd。結果印成純文字、用 exit code 表示按了什麼，
+      見 `rtfs-ui --help` 與 cli_parser()。以下是 JSON 模式。
+  rtfs-ui SPEC_JSON   或   rtfs-ui < spec.json
+      顯示後等使用者操作，印出一行最終結果 JSON。
+  rtfs-ui --stream
+      stdin 第一行是 spec，之後每一行是一個 update（patch JSON），用來持續修改畫面（進度條、追加文字）；
+      {"close": true} 會關閉畫面並結束。stdout 每行一個 JSON：中途事件，最後一行是最終結果。
+      stdin 結束（EOF）不會關閉畫面。
+
+有拿到最終結果就 exit 0，不管使用者按了什麼；怎麼解讀（例如對應 zenity 的 exit code）是轉接層的事。
+錯誤（qs 沒在跑、spec 不合法、qs 重新載入設定）印到 stderr，exit 2；被中斷 exit 130。
+
+spec（全部欄位都可省略）：
+  container  "window"（預設，一般視窗，由 niri 管理）| "modal"（整個桌面變暗、獨佔鍵盤、排隊一次一個）
+             | "file"（檔案選擇，目前由 xdg-desktop-portal 畫；只看 title、save、directory、multiple、filename、
+             filters、timeout，見 shell/DialogFile.qml 開頭；values 是 {paths: [...]}）
+             | "osd"（短暫的螢幕提示，不能操作；新的取代舊的。只看 icon、glyph、text、value、showValue、
+             position、timeout，見 shell/Osd.qml 開頭）
+  title      標題（也是視窗標題）      text   內文
+  markup     內文是 markup（Qt StyledText，大致相容 Pango 的 <b>/<i>/<u>/<br>/<span>）
+  wrap       false：內文不換行          ellipsize  內文超出寬度時用「…」省略
+  icon       info | question | warning | error，或圖示主題名稱、圖檔絕對路徑
+  width／height  大小（px）；省略時依內容決定     maximized／fullscreen  只對 window 有效
+  timeout    秒數，時間到就結束（reason "timeout"）
+  buttons    [{id, label, role, default, disabled, requires}]
+             role: accept | destructive | 其他；default 的按鈕會被 Enter 觸發；
+             requires: field id，那個 field 的值為真才能按。省略時是「取消」+「確定」(id cancel/ok)
+  fields     [{type, id, label, hint, hidden, ...}] 依序排列；id 省略時是 "f<位置>"；
+             label 顯示在 field 上方（check／button 自己顯示），hint 是 field 下方的淡色小字說明。各型別的屬性見 shell/Field<Type>.qml 開頭：
+             entry（單行輸入、密碼、候選清單）、number、text（多行）、label、check、list、scale、calendar、
+             color、font、progress、image、icons（圖示格／程式選擇）、drop（拖放區）、button
+
+update（patch）：
+  title／text／icon／markup／wrap／buttons／timeout 直接取代；
+  fields: {<id>: {屬性...}} 合併進該 field；{<id>: {append: "..."}} 在多行文字後面追加。
+
+最終結果：
+  button   按下的按鈕 id；Esc、關閉視窗、逾時為 null
+  reason   button | dismiss | timeout | closed（--stream 用 close 關閉）| replaced（osd 被別的 osd 取代）
+  values   {<field id>: 值}（每種 field 的值見各檔案說明）
+中途事件：{"event": 名稱, "field": field id, "value": ...}（例如 scale 的 change、drop、button 的 click）
+
+IPC 流程：先開 `qs ipc listen ui ready`，用 ping 確認 listen 收得到，再 open。
+ready signal 只送「<id>」（那個請求有新訊息），內容用 `qs ipc call ui take <id> <token>` 取回
+（{"token": 下次的 token, "messages": [...]}；token 不對是 {"denied": true}）；
+內容不放在 signal 裡，因為 signal 會送給所有 listen 的人，輸入的密碼不能這樣廣播。
+id 是廣播的，所以取件要 token：第一次 ping 的回傳值給第一個，之後每次 take 換新的（參數會被 /proc 看到，
+看到的都是用過的）。被拒絕代表別的程式搶先拿走了訊息，直接報錯。
+qs 每次載入設定後會送「* <generation>」；跟 ping 回應的 generation 不同代表
+畫面已經隨舊設定消失，前端放棄等待。被中斷時呼叫 close 收掉自己的畫面。
+"""
+
+import argparse
+import datetime
+import json
+import os
+import secrets
+import selectors
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+# 介面文字翻譯（shell/i18n）。腳本目錄不一定在 sys.path（python3 -I、從 /usr/bin 的 symlink 執行），自己加。
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from rtfs_i18n import tr  # noqa: E402
+
+
+class UiError(Exception):
+    pass
+
+
+def ipc_call(*args):
+    """呼叫 ui target 的 function，回傳它的回傳值（字串）。"""
+    r = subprocess.run(["qs", "ipc", "call", "ui", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise UiError("qs ipc call failed: " + (r.stderr.strip() or f"exit {r.returncode}"))
+    return r.stdout.rstrip("\n")
+
+
+class Listener:
+    """收自己的訊息：`qs ipc listen ui ready` 只通知「<id> 有東西了」，內容用 take(id) 取回
+    （內容可能是密碼，不能走所有人都收得到的 signal）。
+
+    next() 一次回傳一個 (id, payload)；id 是自己的 rid，或 "*"（payload 為 {"reload": generation}）。
+    """
+
+    def __init__(self, rid, token=None):
+        self.rid = rid
+        self.token = token  # 取件用，handshake 時由 ping 的回傳值設定
+        self.pending = []
+        self.proc = subprocess.Popen(
+            ["qs", "ipc", "listen", "ui", "ready"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.sel = selectors.DefaultSelector()
+        self.sel.register(self.proc.stdout, selectors.EVENT_READ)
+
+    def next(self, timeout=None):
+        """timeout 秒內沒有就回傳 None。listen 結束就丟 UiError。"""
+        end = None if timeout is None else time.monotonic() + timeout
+        while not self.pending:
+            left = None if end is None else max(0, end - time.monotonic())
+            if not self.sel.select(left):
+                return None
+            line = self.proc.stdout.readline()
+            if not line:
+                err = self.proc.stderr.read().strip()
+                raise UiError("lost connection to quickshell" + (": " + err if err else ""))
+            who, _, arg = line.rstrip("\n").partition(" ")
+            if who == "*":
+                self.pending.append(("*", {"reload": arg}))
+            elif who == self.rid:
+                if self.token is None:
+                    continue  # 還沒拿到 token（ping 的回傳值還沒回來），之後的通知會再取
+                try:
+                    box = json.loads(ipc_call("take", self.rid, self.token))
+                    if box.get("denied"):
+                        raise UiError("mailbox access denied: another process may have taken our messages")
+                    self.token = box["token"]
+                    messages = box["messages"]
+                except (json.JSONDecodeError, AttributeError, KeyError) as e:
+                    raise UiError(f"malformed take() result: {e}")
+                self.pending.extend((self.rid, m) for m in messages)
+        return self.pending.pop(0)
+
+    def stop(self):
+        self.proc.kill()
+        self.proc.wait()
+
+
+def handshake(rid, listener):
+    """ping 到 listen 收得到為止；回傳 (generation, listener)（listen 可能重開過）。
+
+    qs 正在啟動或重新載入時，ping 和 listen 都可能因為 target 還不存在而失敗，重試到期限為止。
+    """
+    deadline = time.monotonic() + 3
+    last_error = "no answer"
+    while True:
+        if time.monotonic() > deadline:
+            raise UiError(f"quickshell did not answer ping (is qs running?): {last_error}")
+        try:
+            # 只有第一次成功的 ping 會拿到 token，重試時回傳空字串。
+            token = ipc_call("ping", rid)
+            if token:
+                listener.token = token
+            if listener.token is None:
+                raise UiError("ping returned no mailbox token (id already in use?)")
+            end = time.monotonic() + 0.2
+            while (left := end - time.monotonic()) > 0:
+                msg = listener.next(left)
+                if msg and msg[0] == rid and msg[1].get("ping"):
+                    return msg[1].get("generation"), listener
+        except UiError as e:
+            last_error = str(e)
+            time.sleep(0.1)
+            if listener.proc.poll() is not None:
+                listener = Listener(rid, listener.token)
+
+
+def run(spec, on_event=None, updates=None):
+    """顯示畫面並回傳最終結果 dict。
+
+    on_event(payload)：收到中途事件時呼叫。
+    updates：可迭代的 patch dict 來源（在另一個 thread 讀），{"close": True} 代表關閉。
+    """
+    rid = f"{os.getpid()}-{secrets.token_hex(4)}"
+    listener = Listener(rid)
+    opened = False
+    closed = threading.Event()
+
+    # 被中斷時收掉畫面。SIGINT 預設就會丟 KeyboardInterrupt，其他兩個比照辦理。
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGHUP, interrupt)
+
+    def pump():
+        for patch in updates:
+            if closed.is_set():
+                return
+            try:
+                if patch.get("close"):
+                    ipc_call("close", rid)
+                    closed.set()
+                    return
+                ipc_call("update", rid, json.dumps(patch, ensure_ascii=False))
+            except UiError as e:
+                print(f"rtfs-ui: {e}", file=sys.stderr)
+
+    try:
+        generation, listener = handshake(rid, listener)
+        ipc_call("open", rid, json.dumps(spec, ensure_ascii=False))
+        opened = True
+        if updates is not None:
+            threading.Thread(target=pump, daemon=True).start()
+
+        while True:
+            # 有 update 來源時定期醒來，檢查是不是已經被 close 了。
+            msg = listener.next(0.2 if updates is not None else None)
+            if closed.is_set():
+                opened = False
+                return {"button": None, "reason": "closed", "values": {}}
+            if msg is None:
+                continue
+            rid_got, payload = msg
+            if rid_got == "*":
+                # qs 每次載入設定都會廣播一次；跟 ping 到的 generation 相同代表是我們開畫面之前那次。
+                if payload.get("reload") == generation:
+                    continue
+                opened = False
+                raise UiError("quickshell reloaded its config; dialog was discarded")
+            if rid_got != rid or payload.get("ping"):
+                continue
+            if "warning" in payload:
+                print(f"rtfs-ui: {payload['warning']}", file=sys.stderr)
+                continue
+            if "event" in payload:
+                if on_event:
+                    on_event(payload)
+                continue
+            opened = False
+            if "error" in payload:
+                raise UiError(payload["error"])
+            return payload
+    except KeyboardInterrupt:
+        if opened:
+            try:
+                ipc_call("close", rid)
+            except UiError:
+                pass
+        raise
+    finally:
+        closed.set()
+        listener.stop()
+
+
+# ---------------------------------------------------------------- 命令列模式（給 script 用）
+
+EXIT_OK, EXIT_CANCEL, EXIT_TIMEOUT, EXIT_ERROR = 0, 1, 5, 2
+
+CLI_HELP = tr("""用命令列參數開 UI，給 script 用（每個子命令的選項見 `rtfs-ui 子命令 --help`）。
+
+結果：按確定（或任何自訂按鈕）exit 0，值印到 stdout；取消／Esc／關閉視窗 exit 1；
+逾時 exit 5；錯誤 exit 2；被中斷 exit 130。加 --json 時改印完整的結果 JSON（exit code 不變）。
+
+例：
+  rtfs-ui warning --text "磁碟快滿了"
+  rtfs-ui question --text "要重開機嗎？" && systemctl reboot
+  name=$(rtfs-ui entry --text "你的名字：")
+  ans=$(rtfs-ui question --text "要存檔嗎？" --button 不存 --button 取消 --button 存檔)
+  rtfs-ui list --column 代號 --column 說明 a 第一項 b 第二項
+  long-job | rtfs-ui progress --text "處理中…" --auto-close
+  rtfs-ui osd --icon audio-volume-high --value 40
+  img=$(rtfs-ui file --filter '圖片 | *.png *.jpg')
+
+JSON 模式（完整功能，協定見 rtfs-ui 原始碼開頭）：
+  rtfs-ui SPEC_JSON ｜ rtfs-ui < spec.json ｜ rtfs-ui --stream""")
+
+
+def fmt_num(v):
+    return str(int(v)) if float(v).is_integer() else str(v)
+
+
+def read_input(path):
+    """--file 的內容，沒給時讀 stdin（stdin 是終端機時不讀）。"""
+    if path:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    return "" if sys.stdin.isatty() else sys.stdin.read()
+
+
+def ok_cancel(args, ok=tr("確定"), cancel=tr("取消")):
+    return [{"id": "cancel", "label": args.cancel_label or cancel},
+            {"id": "ok", "label": args.ok_label or ok, "role": "accept", "default": True}]
+
+
+def cmd_message(args):
+    if args.button:
+        # 自訂按鈕：最後一個是預設（Enter），印出按下的按鈕文字。
+        n = len(args.button)
+        buttons = [{"id": f"b{i}", "label": label}
+                   | ({"role": "accept", "default": True} if i == n - 1 else {})
+                   for i, label in enumerate(args.button)]
+        return {"buttons": buttons}, None
+    if args.cmd == "question":
+        return {"buttons": ok_cancel(args, tr("是"), tr("否"))}, None
+    return {"buttons": [{"id": "ok", "label": args.ok_label or tr("確定"), "role": "accept", "default": True}]}, None
+
+
+def cmd_entry(args):
+    field = {"type": "entry", "id": "v", "text": args.entry_text or ""}
+    if args.cmd == "password":
+        field["password"] = True
+    else:
+        if args.placeholder:
+            field["placeholder"] = args.placeholder
+        if args.choice:
+            field["choices"] = args.choice
+            field["editable"] = not args.strict
+    return {"fields": [field], "buttons": ok_cancel(args)}, lambda v: print(v["v"])
+
+
+def cmd_list(args):
+    items = args.items or read_input(None).splitlines()
+    ncol = max(1, len(args.column))
+    rows = [items[i:i + ncol] for i in range(0, len(items), ncol)]
+    if rows and len(rows[-1]) < ncol:
+        raise UiError(f"{len(items)} items do not fill {ncol} columns")
+    mode = "check" if args.checklist else "multiple" if args.multiple else "single"
+    field = {"type": "list", "id": "v", "columns": args.column or [""], "rows": rows, "mode": mode,
+             "hideHeader": not args.column}
+
+    def output(v):
+        for i in v["v"]["selected"]:
+            print(rows[i][0])
+    return {"fields": [field], "buttons": ok_cancel(args)}, output
+
+
+def cmd_text(args):
+    field = {"type": "text", "id": "v", "text": read_input(args.file),
+             "editable": args.editable, "monospace": args.monospace}
+
+    def output(v):
+        print(v["v"], end="" if v["v"].endswith("\n") else "\n")
+    return {"fields": [field], "buttons": ok_cancel(args)}, output if args.editable else None
+
+
+def cmd_scale(args):
+    field = {"type": args.cmd, "id": "v", "min": args.min, "max": args.max, "step": args.step}
+    if args.value is not None:
+        field["value"] = args.value
+    if args.cmd == "number":
+        field["digits"] = args.digits
+    return {"fields": [field], "buttons": ok_cancel(args)}, lambda v: print(fmt_num(v["v"]))
+
+
+def cmd_calendar(args):
+    field = {"type": "calendar", "id": "v"}
+    if args.date:
+        try:
+            d = datetime.date.fromisoformat(args.date)
+        except ValueError:
+            raise UiError(f"invalid --date: {args.date!r} (expected YYYY-MM-DD)")
+        field |= {"year": d.year, "month": d.month, "day": d.day}
+
+    def output(v):
+        print(datetime.date.fromisoformat(v["v"]).strftime(args.format))
+    return {"fields": [field], "buttons": ok_cancel(args)}, output
+
+
+def cmd_color(args):
+    field = {"type": "color", "id": "v", "alpha": args.alpha, "palette": args.palette}
+    if args.color:
+        field["color"] = args.color
+    return {"fields": [field], "buttons": ok_cancel(args)}, lambda v: print(v["v"]["hex"])
+
+
+def cmd_font(args):
+    field = {"type": "font", "id": "v", "bold": args.bold, "italic": args.italic}
+    if args.family:
+        field["family"] = args.family
+    if args.size:
+        field["size"] = args.size
+
+    def output(v):
+        f = v["v"]
+        style = (" Bold" if f["bold"] else "") + (" Italic" if f["italic"] else "")
+        print(f"{f['family']}{style} {fmt_num(f['size'])}")
+    return {"fields": [field], "buttons": ok_cancel(args)}, output
+
+
+def cmd_progress(args):
+    field = {"type": "progress", "id": "v", "value": args.percentage, "pulsate": args.pulsate}
+    buttons = [] if args.no_cancel else [{"id": "cancel", "label": args.cancel_label or tr("取消")}]
+    done = [{"id": "ok", "label": args.ok_label or tr("確定"), "role": "accept", "default": True}]
+
+    def updates():
+        # stdin 一行一筆：數字是百分比，「#」開頭是新的內文。
+        for line in sys.stdin:
+            line = line.strip()
+            if line.startswith("#"):
+                yield {"text": line[1:].strip()}
+            elif line:
+                try:
+                    yield {"fields": {"v": {"value": max(0.0, min(100.0, float(line)))}}}
+                except ValueError:
+                    print(f"rtfs-ui: ignoring progress line: {line!r}", file=sys.stderr)
+        yield {"close": True} if args.auto_close else {"buttons": done, "fields": {"v": {"value": 100, "pulsate": False}}}
+    return {"fields": [field], "buttons": buttons}, None, updates()
+
+
+def cmd_file(args):
+    spec = {"container": "file", "title": args.title or (tr("儲存檔案") if args.save else tr("選擇檔案")),
+            "save": args.save, "directory": args.directory, "multiple": args.multiple}
+    if args.filename:
+        spec["filename"] = args.filename
+    if args.timeout:
+        spec["timeout"] = args.timeout
+    filters = []
+    for f in args.filter or []:
+        name, bar, patterns = f.partition("|")
+        if not bar:
+            name, patterns = f, f
+        filters.append({"name": name.strip(), "patterns": patterns.split()})
+    if filters:
+        spec["filters"] = filters
+
+    def output(v):
+        for path in v["paths"]:
+            print(path)
+    return spec, output
+
+
+def cmd_osd(args):
+    spec = {"container": "osd"}
+    for k in ("icon", "glyph", "text", "value", "position", "timeout"):
+        if getattr(args, k) is not None:
+            spec[k] = getattr(args, k)
+    if args.show_value:
+        spec["showValue"] = True
+    return spec, None
+
+
+DEFAULT_TITLES = {
+    "info": tr("資訊"), "warning": tr("警告"), "error": tr("錯誤"), "question": tr("問題"), "entry": tr("輸入"),
+    "password": tr("密碼"), "list": tr("選擇"), "text": tr("文字"), "scale": tr("調整數值"), "number": tr("輸入數字"),
+    "calendar": tr("選擇日期"), "color": tr("選擇顏色"), "font": tr("選擇字型"), "progress": tr("進度"),
+}
+
+
+def cli_parser():
+    raw = argparse.RawDescriptionHelpFormatter
+    p = argparse.ArgumentParser(prog="rtfs-ui", description=CLI_HELP, formatter_class=raw)
+    sub = p.add_subparsers(dest="cmd", metavar=tr("子命令"), required=True)
+
+    common = argparse.ArgumentParser(add_help=False)
+    g = common.add_argument_group(tr("共用選項"))
+    g.add_argument("--title", help=tr("視窗標題"))
+    g.add_argument("--text", help=tr("內文"))
+    g.add_argument("--markup", action="store_true", help=tr("內文是 markup（<b>、<i>、<br> 等）"))
+    g.add_argument("--icon", help=tr("info／question／warning／error，或圖示名稱、圖檔絕對路徑"))
+    g.add_argument("--width", type=int, help=tr("寬度（px）"))
+    g.add_argument("--height", type=int, help=tr("高度（px）"))
+    g.add_argument("--timeout", type=int, metavar=tr("秒"), help=tr("時間到自動結束（exit 5）"))
+    g.add_argument("--modal", action="store_true", help=tr("整個桌面變暗、獨佔鍵盤（預設是一般視窗）"))
+    g.add_argument("--ok-label", metavar=tr("文字"), help=tr("確定按鈕的文字"))
+    g.add_argument("--cancel-label", metavar=tr("文字"), help=tr("取消按鈕的文字"))
+    g.add_argument("--json", action="store_true", help=tr("印出完整的結果 JSON，而不是純文字"))
+
+    def add(name, func, help, description=None):
+        sp = sub.add_parser(name, parents=[common], help=help, description=description or help,
+                            formatter_class=raw)
+        sp.set_defaults(func=func)
+        return sp
+
+    for name, help in (("info", tr("資訊訊息")), ("warning", tr("警告訊息")), ("error", tr("錯誤訊息")),
+                       ("question", tr("是／否問題（「是」exit 0，「否」exit 1）"))):
+        sp = add(name, cmd_message, help)
+        sp.add_argument("--button", action="append", metavar=tr("文字"),
+                        help=tr("自訂按鈕（可重複，取代預設按鈕；最後一個是預設按鈕）；印出按下的按鈕文字"))
+
+    sp = add("entry", cmd_entry, tr("單行輸入，印出輸入的文字"))
+    sp.add_argument("--entry-text", metavar=tr("文字"), help=tr("預設內容"))
+    sp.add_argument("--placeholder", metavar=tr("文字"), help=tr("空白時顯示的提示"))
+    sp.add_argument("--choice", action="append", metavar=tr("文字"), help=tr("候選項目（可重複）"))
+    sp.add_argument("--strict", action="store_true", help=tr("只能從 --choice 選"))
+
+    sp = add("password", cmd_entry, tr("密碼輸入，印出輸入的密碼"))
+    sp.add_argument("--entry-text", metavar=tr("文字"), help=tr("預設內容"))
+
+    sp = add("list", cmd_list, tr("從清單選擇，印出選到的列的第一欄（一列一行）"),
+             tr("從清單選擇，印出選到的列的第一欄（一列一行）。\n"
+                "項目依序填滿每一列（有 N 個 --column 就每 N 個項目一列）；沒給項目時從 stdin 一行讀一個。"))
+    sp.add_argument("items", nargs="*", metavar=tr("項目"))
+    sp.add_argument("--column", action="append", default=[], metavar=tr("標題"), help=tr("欄位標題（可重複）"))
+    sp.add_argument("--multiple", action="store_true", help=tr("可以選多列（Ctrl／Shift）"))
+    sp.add_argument("--checklist", action="store_true", help=tr("每列前面有核取方塊"))
+
+    sp = add("text", cmd_text, tr("顯示（或編輯）多行文字"),
+             tr("顯示多行文字（內容來自 --file 或 stdin）；--editable 時印出編輯後的內容。"))
+    sp.add_argument("--file", metavar=tr("路徑"), help=tr("從檔案讀內容（預設讀 stdin）"))
+    sp.add_argument("--editable", action="store_true", help=tr("可以編輯，印出結果"))
+    sp.add_argument("--monospace", action="store_true", help=tr("等寬字型"))
+
+    for name, help in (("scale", tr("滑桿，印出選的數值")), ("number", tr("數字輸入，印出數值"))):
+        sp = add(name, cmd_scale, help)
+        sp.add_argument("--value", type=float, help=tr("初始值"))
+        sp.add_argument("--min", type=float, default=0, help=tr("最小值（預設 0）"))
+        sp.add_argument("--max", type=float, default=100, help=tr("最大值（預設 100）"))
+        sp.add_argument("--step", type=float, default=1, help=tr("一格的大小（預設 1）"))
+        if name == "number":
+            sp.add_argument("--digits", type=int, default=0, help=tr("小數位數（預設 0）"))
+
+    sp = add("calendar", cmd_calendar, tr("選擇日期，印出日期"))
+    sp.add_argument("--date", metavar="YYYY-MM-DD", help=tr("初始日期（預設今天）"))
+    sp.add_argument("--format", default="%Y-%m-%d", help=tr("輸出格式（strftime，預設 %%Y-%%m-%%d）"))
+
+    sp = add("color", cmd_color, tr("選擇顏色，印出 #rrggbb（有透明度時 #rrggbbaa）"))
+    sp.add_argument("--color", help=tr("初始顏色（#rrggbb 或顏色名稱）"))
+    sp.add_argument("--alpha", action="store_true", help=tr("可調透明度"))
+    sp.add_argument("--palette", action="store_true", help=tr("顯示色票"))
+
+    sp = add("font", cmd_font, tr("選擇字型，印出「字型名稱 [Bold] [Italic] 大小」"))
+    sp.add_argument("--family", help=tr("初始字型"))
+    sp.add_argument("--size", type=float, help=tr("初始大小（px）"))
+    sp.add_argument("--bold", action="store_true")
+    sp.add_argument("--italic", action="store_true")
+
+    sp = add("progress", cmd_progress, tr("進度條，從 stdin 讀進度"),
+             tr("進度條。stdin 一行一筆：數字（0–100）是百分比，「#」開頭的行是新的內文。\n"
+                "stdin 結束後出現確定按鈕（或用 --auto-close 直接關閉，exit 0）；按取消 exit 1。"))
+    sp.add_argument("--percentage", type=float, default=0, help=tr("初始百分比"))
+    sp.add_argument("--pulsate", action="store_true", help=tr("不確定進度，來回跑"))
+    sp.add_argument("--auto-close", action="store_true", help=tr("stdin 結束時自動關閉"))
+    sp.add_argument("--no-cancel", action="store_true", help=tr("不顯示取消按鈕"))
+
+    # file、osd 不是 rtfs 自己的對話框，不吃共用選項。
+    sp = sub.add_parser("file", help=tr("選擇檔案，印出路徑（一行一個）"),
+                        description=tr("選擇檔案或目錄，印出路徑（一行一個）。目前由 xdg-desktop-portal 顯示。"))
+    sp.set_defaults(func=cmd_file)
+    sp.add_argument("--title", help=tr("視窗標題"))
+    sp.add_argument("--save", action="store_true", help=tr("存檔（可以輸入新檔名）"))
+    sp.add_argument("--directory", action="store_true", help=tr("選目錄"))
+    sp.add_argument("--multiple", action="store_true", help=tr("可以選多個"))
+    sp.add_argument("--filename", metavar=tr("路徑"),
+                    help=tr("一開始選取的檔案；結尾 / 的絕對路徑代表從這個目錄開始；存檔時不存在的檔案當成建議檔名"))
+    sp.add_argument("--filter", action="append", metavar=tr("'名稱 | *.a *.b'"), help=tr("檔案類型篩選（可重複）"))
+    sp.add_argument("--timeout", type=int, metavar=tr("秒"), help=tr("時間到自動結束（exit 5）"))
+    sp.add_argument("--json", action="store_true", help=tr("印出完整的結果 JSON"))
+
+    # osd 不是對話框，不吃共用選項。
+    sp = sub.add_parser("osd", help=tr("螢幕提示（不能操作），等它消失才結束"),
+                        description=tr("螢幕提示（不能操作，滑鼠穿透），等它消失才結束；新的 osd 會取代舊的。"))
+    sp.set_defaults(func=cmd_osd)
+    sp.add_argument("--icon", help=tr("info／question／warning／error，或圖示名稱、圖檔絕對路徑"))
+    sp.add_argument("--glyph", help=tr("FontAwesome 字元（優先於 --icon）"))
+    sp.add_argument("--text", help=tr("文字"))
+    sp.add_argument("--value", type=float, help=tr("0–100，顯示進度條"))
+    sp.add_argument("--show-value", action="store_true", help=tr("進度條旁顯示百分比"))
+    sp.add_argument("--position", choices=["top-left", "top", "top-right", "left", "center", "right",
+                                           "bottom-left", "bottom", "bottom-right"])
+    sp.add_argument("--timeout", type=float, metavar=tr("秒"), help=tr("顯示多久（預設見設定 osd.timeout）"))
+    sp.add_argument("--json", action="store_true", help=tr("印出完整的結果 JSON"))
+    return p
+
+
+def cli_main(argv):
+    args = cli_parser().parse_args(argv)
+    try:
+        spec, output, *updates = args.func(args)
+    except (UiError, OSError) as e:
+        print(f"rtfs-ui: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    if args.cmd not in ("osd", "file"):
+        spec["title"] = args.title if args.title is not None else DEFAULT_TITLES[args.cmd]
+        icon = args.icon or (args.cmd if args.cmd in ("info", "warning", "error", "question") else None)
+        for k, v in (("text", args.text), ("icon", icon), ("width", args.width),
+                     ("height", args.height), ("timeout", args.timeout)):
+            if v is not None:
+                spec[k] = v
+        if args.markup:
+            spec["markup"] = True
+        if args.modal:
+            spec["container"] = "modal"
+    try:
+        result = run(spec, updates=updates[0] if updates else None)
+    except UiError as e:
+        print(f"rtfs-ui: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    except KeyboardInterrupt:
+        return 130
+
+    button, reason = result.get("button"), result.get("reason")
+    if args.cmd == "osd" or reason == "closed":
+        code = EXIT_OK
+    elif reason == "timeout":
+        code = EXIT_TIMEOUT
+    elif button is None or button == "cancel":
+        code = EXIT_CANCEL
+    else:
+        code = EXIT_OK
+    if args.json:
+        emit(result)
+    elif code == EXIT_OK and button is not None:
+        if button.startswith("b") and getattr(args, "button", None):
+            print(args.button[int(button[1:])])
+        elif output:
+            output(result.get("values", {}))
+    return code
+
+
+def stdin_patches():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError as e:
+            print(f"rtfs-ui: ignoring invalid update JSON: {e}", file=sys.stderr)
+
+
+def emit(payload):
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def main():
+    if sys.argv[1:2] and (sys.argv[1] in ("-h", "--help") or sys.argv[1][:1].isalpha()):
+        return cli_main(sys.argv[1:])
+    stream = sys.argv[1:2] == ["--stream"]
+    if stream:
+        raw = sys.stdin.readline()
+    else:
+        raw = sys.argv[1] if len(sys.argv) > 1 else sys.stdin.read()
+    try:
+        spec = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"rtfs-ui: invalid spec JSON: {e}", file=sys.stderr)
+        return 2
+    try:
+        if stream:
+            result = run(spec, on_event=emit, updates=stdin_patches())
+        else:
+            result = run(spec)
+    except UiError as e:
+        print(f"rtfs-ui: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+    emit(result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
